@@ -36,9 +36,11 @@
 #define MO1_IN2   TIM_CHANNEL_2   // PD13  TIM4_CH2
 #define MO2_IN1   TIM_CHANNEL_3   // PD14  TIM4_CH3  Motor 2 (U2, J7)
 #define MO2_IN2   TIM_CHANNEL_4   // PD15  TIM4_CH4
+#define MOTOR_MAX_DUTY_PERCENT 71
 #define LINK_TIMEOUT_MS       400U
 #define STATUS_PERIOD_MS      100U
 #define RX_LINE_CAPACITY       16U
+#define UART_RX_BUFFER_CAPACITY 64U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,7 +59,11 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+static uint8_t uart_rx_interrupt_byte;
+static volatile uint8_t uart_rx_buffer[UART_RX_BUFFER_CAPACITY];
+static volatile uint16_t uart_rx_head;
+static volatile uint16_t uart_rx_tail;
+static volatile uint32_t uart_rx_errors;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,9 +78,10 @@ static void MX_ADC2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void Motors_Stop(void);
-static void Motors_SetWheelPercent(uint8_t left, uint8_t right);
+static int16_t Motors_ClampWheelPercent(int16_t percent);
+static void Motors_SetWheelPercent(int16_t left, int16_t right);
 static uint8_t Parse_Wheel_Command(const char *line, uint8_t length,
-                                   uint8_t *left, uint8_t *right);
+                                   int16_t *left, int16_t *right);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -91,31 +98,55 @@ static void Motors_Stop(void)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
 }
 
-static void Motors_SetWheelPercent(uint8_t left, uint8_t right)
+static int16_t Motors_ClampWheelPercent(int16_t percent)
+{
+  if (percent > MOTOR_MAX_DUTY_PERCENT)
+  {
+    return MOTOR_MAX_DUTY_PERCENT;
+  }
+  if (percent < -MOTOR_MAX_DUTY_PERCENT)
+  {
+    return -MOTOR_MAX_DUTY_PERCENT;
+  }
+  return percent;
+}
+
+static void Motors_SetWheelPercent(int16_t left, int16_t right)
 {
   uint32_t period = __HAL_TIM_GET_AUTORELOAD(&htim4) + 1U;
-  uint32_t left_duty = (period * left) / 100U;
-  uint32_t right_duty = (period * right) / 100U;
+  uint32_t left_magnitude = (uint32_t)(left < 0 ? -left : left);
+  uint32_t right_magnitude = (uint32_t)(right < 0 ? -right : right);
+  uint32_t left_duty = (period * left_magnitude) / 100U;
+  uint32_t right_duty = (period * right_magnitude) / 100U;
 
-  /* Motor 1 (J8) is treated as the left wheel; Motor 2 (J7) as the right. */
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, left_duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, right_duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0U);
+  /* Motor 1 (J8) is the left wheel. Motor 2 (J7) is mounted as its mirror,
+     so drive its opposite input to make positive duty move both wheels
+     forward. */
+  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, left > 0 ? left_duty : 0U);
+  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, left < 0 ? left_duty : 0U);
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, right < 0 ? right_duty : 0U);
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, right > 0 ? right_duty : 0U);
 
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin,
-                    left > 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                    left != 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin,
-                    right > 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                    right != 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0,
-                    (left > 0U || right > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                    (left != 0 || right != 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static uint8_t Parse_Percent(const char *line, uint8_t length,
-                             uint8_t *at, uint8_t *value)
+                             uint8_t *at, int16_t *value)
 {
   uint16_t total = 0U;
   uint8_t digits = 0U;
+  uint8_t negative = 0U;
+
+  if (*at < length && line[*at] == '-')
+  {
+    negative = 1U;
+    (*at)++;
+  }
 
   while (*at < length && line[*at] >= '0' && line[*at] <= '9' && digits < 4U)
   {
@@ -127,12 +158,12 @@ static uint8_t Parse_Percent(const char *line, uint8_t length,
   {
     return 0U;
   }
-  *value = (uint8_t)total;
+  *value = negative != 0U ? -(int16_t)total : (int16_t)total;
   return 1U;
 }
 
 static uint8_t Parse_Wheel_Command(const char *line, uint8_t length,
-                                   uint8_t *left, uint8_t *right)
+                                   int16_t *left, int16_t *right)
 {
   uint8_t at = 1U;
 
@@ -162,10 +193,11 @@ int main(void)
   char rx_line[RX_LINE_CAPACITY];
   uint8_t rx_length = 0U;
   uint8_t rx_spoiled = 0U;
-  uint8_t left_percent = 0U;
-  uint8_t right_percent = 0U;
+  int16_t left_percent = 0;
+  int16_t right_percent = 0;
   uint8_t link_live = 0U;
   uint32_t rejected = 0U;
+  uint32_t observed_rx_errors = 0U;
   uint32_t last_command_tick = 0U;
   uint32_t last_status_tick = 0U;
   char status_message[48];
@@ -213,6 +245,10 @@ int main(void)
   }
 
   Motors_Stop();
+  if (HAL_UART_Receive_IT(&huart1, &uart_rx_interrupt_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
   HAL_UART_Transmit(&huart1, (uint8_t *)identity,
                     sizeof(identity) - 1U, 100U);
   last_status_tick = HAL_GetTick();
@@ -225,11 +261,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_StatusTypeDef receive_status =
-        HAL_UART_Receive(&huart1, &received_byte, 1U, 5U);
-
-    if (receive_status == HAL_OK)
+    if (uart_rx_tail != uart_rx_head)
     {
+      received_byte = uart_rx_buffer[uart_rx_tail];
+      uart_rx_tail = (uint16_t)((uart_rx_tail + 1U) % UART_RX_BUFFER_CAPACITY);
+
       if (received_byte == '\n')
       {
         if (rx_spoiled != 0U)
@@ -245,6 +281,8 @@ int main(void)
                  Parse_Wheel_Command(rx_line, rx_length,
                                      &left_percent, &right_percent) != 0U)
         {
+          left_percent = Motors_ClampWheelPercent(left_percent);
+          right_percent = Motors_ClampWheelPercent(right_percent);
           Motors_SetWheelPercent(left_percent, right_percent);
           last_command_tick = HAL_GetTick();
           link_live = 1U;
@@ -269,30 +307,31 @@ int main(void)
         rx_spoiled = 1U;
       }
     }
-    else if (receive_status != HAL_TIMEOUT)
+
+    if (observed_rx_errors != uart_rx_errors)
     {
       rx_length = 0U;
       rx_spoiled = 0U;
-      rejected++;
-      __HAL_UART_CLEAR_OREFLAG(&huart1);
+      rejected += uart_rx_errors - observed_rx_errors;
+      observed_rx_errors = uart_rx_errors;
     }
 
     uint32_t now = HAL_GetTick();
     if (link_live != 0U && now - last_command_tick > LINK_TIMEOUT_MS)
     {
       Motors_Stop();
-      left_percent = 0U;
-      right_percent = 0U;
+      left_percent = 0;
+      right_percent = 0;
       link_live = 0U;
     }
 
     if (now - last_status_tick >= STATUS_PERIOD_MS)
     {
       int length = snprintf(status_message, sizeof(status_message),
-                            "S %s %u %u %lu\r\n",
+                            "S %s %d %d %lu\r\n",
                             link_live != 0U ? "pc" : "idle",
-                            (unsigned int)left_percent,
-                            (unsigned int)right_percent,
+                            (int)left_percent,
+                            (int)right_percent,
                             (unsigned long)rejected);
       if (length > 0)
       {
@@ -711,6 +750,41 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uint16_t next = (uint16_t)((uart_rx_head + 1U) % UART_RX_BUFFER_CAPACITY);
+
+    if (next != uart_rx_tail)
+    {
+      uart_rx_buffer[uart_rx_head] = uart_rx_interrupt_byte;
+      uart_rx_head = next;
+    }
+    else
+    {
+      uart_rx_errors++;
+    }
+
+    if (HAL_UART_Receive_IT(huart, &uart_rx_interrupt_byte, 1U) != HAL_OK)
+    {
+      uart_rx_errors++;
+    }
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uart_rx_errors++;
+    if (huart->RxState == HAL_UART_STATE_READY)
+    {
+      (void)HAL_UART_Receive_IT(huart, &uart_rx_interrupt_byte, 1U);
+    }
+  }
+}
 
 /* USER CODE END 4 */
 

@@ -19,3 +19,15 @@ _autosave-*
 
 # Optional ERC export (if you save JSON next to the repo root)
 /ERC.json
+
+# Generated build, editor, and local Python files
+**/Debug/
+**/Release/
+**/.settings/language.settings.xml
+**/.history/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.egg-info/
+**/runs/
+**/~*.kicad_pro.lck

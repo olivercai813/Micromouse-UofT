@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "micro-mind-to-motor"
+version = "0.1.0"
+description = "Drive the UofT Micromouse from a Muse EEG headband through an HC-05"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pyserial>=3.5"]
+
+[project.optional-dependencies]
+ble = ["bleak>=0.21"]
+test = ["pytest>=7", "scipy", "unicorn>=2"]
+
+[project.scripts]
+mind2motor = "mind2motor.cli:main"
+micro-mind-to-motor = "mind2motor.cli:main"
+
+[tool.setuptools]
+packages = ["mind2motor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+# Unicorn's memory mapping raises and handles an access violation of its own
+# on Windows; pytest's fault handler would print a stack for each one.
+addopts = "-p no:faulthandler"
