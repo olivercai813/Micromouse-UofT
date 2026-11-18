@@ -75,6 +75,8 @@ void Error_Handler(void);
 #define NSLEEP_HB_2_GPIO_Port GPIOE
 #define Encoder_B_1_Pin GPIO_PIN_11
 #define Encoder_B_1_GPIO_Port GPIOE
+#define IMU_CS_Pin GPIO_PIN_12
+#define IMU_CS_GPIO_Port GPIOB
 #define MO1_IN1_Pin GPIO_PIN_12
 #define MO1_IN1_GPIO_Port GPIOD
 #define MO1_IN2_Pin GPIO_PIN_13
@@ -83,6 +85,10 @@ void Error_Handler(void);
 #define MO2_IN1_GPIO_Port GPIOD
 #define MO2_IN2_Pin GPIO_PIN_15
 #define MO2_IN2_GPIO_Port GPIOD
+#define IMU_INT_1_Pin GPIO_PIN_6
+#define IMU_INT_1_GPIO_Port GPIOC
+#define IMU_INT_2_Pin GPIO_PIN_7
+#define IMU_INT_2_GPIO_Port GPIOC
 #define BT_EN_Pin GPIO_PIN_4
 #define BT_EN_GPIO_Port GPIOB
 #define BT_STATE_Pin GPIO_PIN_5

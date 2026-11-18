@@ -36,7 +36,9 @@
 #define MO1_IN2   TIM_CHANNEL_2   // PD13  TIM4_CH2
 #define MO2_IN1   TIM_CHANNEL_3   // PD14  TIM4_CH3  Motor 2 (U2, J7)
 #define MO2_IN2   TIM_CHANNEL_4   // PD15  TIM4_CH4
-#define MOTOR_TEST_DUTY_PERCENT  50U
+#define MOTOR_MAX_DUTY_PERCENT      71U
+#define MOTOR_COMMAND_DUTY_PERCENT  50U
+#define MOTOR_COMMAND_TIMEOUT_MS   500U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +49,8 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
+
+SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
@@ -67,11 +71,13 @@ static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_ADC2_Init(void);
+static void MX_SPI2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void Motors_Stop(void);
-static void Motors_Forward(uint32_t duty);
-static void Motors_Backward(uint32_t duty);
+static uint32_t Motors_DutyFromPercent(uint32_t percent);
+static void Motors_Forward(uint32_t percent);
+static void Motors_Backward(uint32_t percent);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -88,30 +94,44 @@ static void Motors_Stop(void)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
 }
 
-static void Motors_Forward(uint32_t duty)
+static uint32_t Motors_DutyFromPercent(uint32_t percent)
 {
+  if (percent > MOTOR_MAX_DUTY_PERCENT)
+  {
+    percent = MOTOR_MAX_DUTY_PERCENT;
+  }
+  return ((__HAL_TIM_GET_AUTORELOAD(&htim4) + 1U) * percent) / 100U;
+}
+
+static void Motors_Forward(uint32_t percent)
+{
+  uint32_t duty = Motors_DutyFromPercent(percent);
+
   Motors_Stop();
   HAL_Delay(10);
 
   __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, duty);
   __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0U);
+  /* Motor 2 is physically mirrored, so its forward polarity is opposite. */
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, 0U);
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, duty);
 
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
 }
 
-static void Motors_Backward(uint32_t duty)
+static void Motors_Backward(uint32_t percent)
 {
+  uint32_t duty = Motors_DutyFromPercent(percent);
+
   Motors_Stop();
   HAL_Delay(10);
 
   __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, 0U);
   __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, duty);
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, duty);
+  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0U);
 
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
@@ -140,10 +160,13 @@ int main(void)
   static const uint8_t led_on_message[] = "LED ON\r\n";
   static const uint8_t led_off_message[] = "LED OFF\r\n";
 #endif
-  static const uint8_t forward_message[] = "FORWARD\r\n";
-  static const uint8_t backward_message[] = "BACKWARD\r\n";
+  static const uint8_t ready_message[] = "MICROMOUSE READY MAX_PWM=71\r\n";
+  static const uint8_t forward_message[] = "FORWARD 50\r\n";
+  static const uint8_t backward_message[] = "BACKWARD 50\r\n";
   static const uint8_t stop_message[] = "STOP\r\n";
-  uint32_t motor_duty = 0U;
+  static const uint8_t timeout_message[] = "TIMEOUT STOP\r\n";
+  uint32_t last_motor_command_tick = 0U;
+  uint8_t motors_active = 0U;
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -172,29 +195,12 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_ADC2_Init();
+  MX_SPI2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* Keep both motor drivers asleep during the Bluetooth-only test. */
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
-
-  /* Motor test intentionally disabled to prevent motor current draw. */
-#if 0
-  uint32_t full = __HAL_TIM_GET_AUTORELOAD(&htim4) + 1;
-
-  HAL_TIM_PWM_Start(&htim4, MO1_IN1);
-  HAL_TIM_PWM_Start(&htim4, MO1_IN2);
-  HAL_TIM_PWM_Start(&htim4, MO2_IN1);
-  HAL_TIM_PWM_Start(&htim4, MO2_IN2);
-
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, full);
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, 0);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, full);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0);
-
-  HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
-#endif
 
   /* Start PWM with every input at 0% duty, then keep both drivers asleep. */
   if (HAL_TIM_PWM_Start(&htim4, MO1_IN1) != HAL_OK ||
@@ -205,9 +211,9 @@ int main(void)
     Error_Handler();
   }
 
-  motor_duty = ((__HAL_TIM_GET_AUTORELOAD(&htim4) + 1U) *
-                MOTOR_TEST_DUTY_PERCENT) / 100U;
   Motors_Stop();
+  HAL_UART_Transmit(&huart1, (uint8_t *)ready_message,
+                    sizeof(ready_message) - 1U, 100U);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -256,23 +262,42 @@ int main(void)
     {
       if (received_byte == 'f' || received_byte == 'F')
       {
-        Motors_Forward(motor_duty);
+        Motors_Forward(MOTOR_COMMAND_DUTY_PERCENT);
+        last_motor_command_tick = HAL_GetTick();
+        motors_active = 1U;
         HAL_UART_Transmit(&huart1, (uint8_t *)forward_message,
                           sizeof(forward_message) - 1U, 100);
       }
       else if (received_byte == 'b' || received_byte == 'B')
       {
-        Motors_Backward(motor_duty);
+        Motors_Backward(MOTOR_COMMAND_DUTY_PERCENT);
+        last_motor_command_tick = HAL_GetTick();
+        motors_active = 1U;
         HAL_UART_Transmit(&huart1, (uint8_t *)backward_message,
                           sizeof(backward_message) - 1U, 100);
       }
       else if (received_byte == 's' || received_byte == 'S')
       {
         Motors_Stop();
+        motors_active = 0U;
         HAL_UART_Transmit(&huart1, (uint8_t *)stop_message,
                           sizeof(stop_message) - 1U, 100);
       }
+      else if (received_byte == '?')
+      {
+        HAL_UART_Transmit(&huart1, (uint8_t *)ready_message,
+                          sizeof(ready_message) - 1U, 100U);
+      }
       /* Carriage return, newline, and other characters are ignored. */
+    }
+
+    if (motors_active != 0U &&
+        HAL_GetTick() - last_motor_command_tick > MOTOR_COMMAND_TIMEOUT_MS)
+    {
+      Motors_Stop();
+      motors_active = 0U;
+      HAL_UART_Transmit(&huart1, (uint8_t *)timeout_message,
+                        sizeof(timeout_message) - 1U, 100U);
     }
   }
   /* USER CODE END 3 */
@@ -423,6 +448,46 @@ static void MX_ADC2_Init(void)
   /* USER CODE BEGIN ADC2_Init 2 */
 
   /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
 
 }
 
@@ -653,10 +718,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|BT_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, NSLEEP_HB_1_Pin|NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
+
+  /* Keep the SPI device deselected until a transaction begins. */
+  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PB0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
@@ -672,11 +740,31 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : BT_EN_Pin BT_STATE_Pin */
-  GPIO_InitStruct.Pin = BT_EN_Pin|BT_STATE_Pin;
+  /* HC-05 KEY/EN: low selects normal Bluetooth data mode. */
+  GPIO_InitStruct.Pin = BT_EN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(BT_EN_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BT_STATE_Pin */
+  GPIO_InitStruct.Pin = BT_STATE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(BT_STATE_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : IMU_CS_Pin */
+  GPIO_InitStruct.Pin = IMU_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(IMU_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : IMU_INT_1_Pin IMU_INT_2_Pin */
+  GPIO_InitStruct.Pin = IMU_INT_1_Pin|IMU_INT_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
