@@ -57,6 +57,7 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
+extern UART_HandleTypeDef huart1;
 
 /* USER CODE END EV */
 
@@ -187,6 +188,7 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
+  Micromouse_SafetyTick();
 
   /* USER CODE END SysTick_IRQn 1 */
 }
@@ -199,5 +201,10 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
 
 /* USER CODE END 1 */

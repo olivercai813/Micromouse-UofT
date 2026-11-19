@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,8 +39,22 @@
 #define MO2_IN1   TIM_CHANNEL_3   // PD14  TIM4_CH3  Motor 2 (U2, J7)
 #define MO2_IN2   TIM_CHANNEL_4   // PD15  TIM4_CH4
 #define MOTOR_MAX_DUTY_PERCENT      71U
-#define MOTOR_COMMAND_DUTY_PERCENT  50U
-#define MOTOR_COMMAND_TIMEOUT_MS   500U
+#define MOTOR_MAX_DUTY_TENTHS      710U
+#define MOTOR_MAX_RUN_MS         10000U
+#define TELEMETRY_DEFAULT_MS       250U
+#define SENSOR_MISSING          (-32768)
+
+#define FLAG_IMU           (1U << 0)
+#define FLAG_MAG           (1U << 1)
+#define FLAG_IR            (1U << 2)
+#define FLAG_TOF_1         (1U << 3)
+#define FLAG_TOF_2         (1U << 4)
+#define FLAG_TOF_3         (1U << 5)
+#define FLAG_BT_CONNECTED  (1U << 6)
+#define FLAG_MOTORS_ACTIVE (1U << 7)
+
+#define LIS2MDL_ADDR       0x1EU
+#define VL53_DEFAULT_ADDR  0x29U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,7 +75,34 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+static I2C_HandleTypeDef hi2c1;
+static ADC_HandleTypeDef hadc3;
+static int32_t encoder_total[2] = {0, 0};
+static uint16_t encoder_previous[2] = {0, 0};
+static int32_t imu_values[6] = {0};
+static int32_t mag_values[3] = {0};
+static uint16_t ir_values[4] = {0};
+static uint16_t tof_values[3] = {0};
+static uint8_t sensor_flags = 0U;
+static volatile int16_t commanded_left_tenths = 0;
+static volatile int16_t commanded_right_tenths = 0;
+static volatile uint32_t motor_stop_tick = 0U;
+static volatile uint32_t emergency_stop_generation = 0U;
+static volatile uint8_t motor_timeout_event_pending = 0U;
+static volatile uint8_t emergency_stop_ack_pending = 0U;
+static uint32_t telemetry_period_ms = TELEMETRY_DEFAULT_MS;
+static uint8_t uart_rx_byte = 0U;
+static volatile uint8_t uart_rx_head = 0U;
+static volatile uint8_t uart_rx_tail = 0U;
+static uint8_t uart_rx_ring[128] = {0};
+static uint8_t uart_stop_candidate = 1U;
+static uint8_t uart_stop_index = 0U;
+static volatile uint32_t uart_stop_flush_generation = 0U;
+static uint8_t uart_tx_byte = 0U;
+static volatile uint16_t uart_tx_head = 0U;
+static volatile uint16_t uart_tx_tail = 0U;
+static volatile uint8_t uart_tx_busy = 0U;
+static uint8_t uart_tx_ring[512] = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,9 +118,16 @@ static void MX_SPI2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void Motors_Stop(void);
-static uint32_t Motors_DutyFromPercent(uint32_t percent);
-static void Motors_Forward(uint32_t percent);
-static void Motors_Backward(uint32_t percent);
+static uint32_t Motors_DutyFromTenths(uint32_t percent_tenths);
+static uint8_t Motors_SetSignedTenths(int32_t left_tenths, int32_t right_tenths,
+                                      uint32_t command_generation);
+static void Encoders_Update(void);
+static void Encoders_Reset(void);
+static void SensorHardware_Init(void);
+static void Sensors_Update(void);
+static void Protocol_HandleLine(char *line, uint32_t command_generation);
+static void Protocol_SendTelemetry(void);
+static uint8_t UART_PopByte(uint8_t *value);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -92,50 +142,448 @@ static void Motors_Stop(void)
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  commanded_left_tenths = 0;
+  commanded_right_tenths = 0;
+  motor_stop_tick = 0U;
 }
 
-static uint32_t Motors_DutyFromPercent(uint32_t percent)
+static uint32_t Motors_DutyFromTenths(uint32_t percent_tenths)
 {
-  if (percent > MOTOR_MAX_DUTY_PERCENT)
+  if (percent_tenths > MOTOR_MAX_DUTY_TENTHS)
   {
-    percent = MOTOR_MAX_DUTY_PERCENT;
+    percent_tenths = MOTOR_MAX_DUTY_TENTHS;
   }
-  return ((__HAL_TIM_GET_AUTORELOAD(&htim4) + 1U) * percent) / 100U;
+  return ((__HAL_TIM_GET_AUTORELOAD(&htim4) + 1U) * percent_tenths) / 1000U;
 }
 
-static void Motors_Forward(uint32_t percent)
+static int32_t ClampMotorPercent(int32_t percent)
 {
-  uint32_t duty = Motors_DutyFromPercent(percent);
+  if (percent > (int32_t)MOTOR_MAX_DUTY_PERCENT) return MOTOR_MAX_DUTY_PERCENT;
+  if (percent < -(int32_t)MOTOR_MAX_DUTY_PERCENT) return -(int32_t)MOTOR_MAX_DUTY_PERCENT;
+  return percent;
+}
+
+static int32_t ClampMotorTenths(int32_t percent_tenths)
+{
+  if (percent_tenths > (int32_t)MOTOR_MAX_DUTY_TENTHS) return MOTOR_MAX_DUTY_TENTHS;
+  if (percent_tenths < -(int32_t)MOTOR_MAX_DUTY_TENTHS) return -(int32_t)MOTOR_MAX_DUTY_TENTHS;
+  return percent_tenths;
+}
+
+static void Motor_SetOne(uint32_t in1, uint32_t in2, int32_t percent_tenths)
+{
+  uint32_t duty = Motors_DutyFromTenths((uint32_t)abs(percent_tenths));
+
+  if (percent_tenths > 0)
+  {
+    __HAL_TIM_SET_COMPARE(&htim4, in1, duty);
+    __HAL_TIM_SET_COMPARE(&htim4, in2, 0U);
+  }
+  else if (percent_tenths < 0)
+  {
+    __HAL_TIM_SET_COMPARE(&htim4, in1, 0U);
+    __HAL_TIM_SET_COMPARE(&htim4, in2, duty);
+  }
+  else
+  {
+    __HAL_TIM_SET_COMPARE(&htim4, in1, 0U);
+    __HAL_TIM_SET_COMPARE(&htim4, in2, 0U);
+  }
+}
+
+static uint8_t Motors_SetSignedTenths(int32_t left_tenths, int32_t right_tenths,
+                                      uint32_t command_generation)
+{
+  uint32_t stop_generation = emergency_stop_generation;
+  if (stop_generation != command_generation) return 0U;
+  left_tenths = ClampMotorTenths(left_tenths);
+  right_tenths = ClampMotorTenths(right_tenths);
 
   Motors_Stop();
-  HAL_Delay(10);
-
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, 0U);
-  /* Motor 2 is physically mirrored, so its forward polarity is opposite. */
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, duty);
+  if (left_tenths == 0 && right_tenths == 0) return 1U;
 
   HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+  HAL_Delay(2);
+
+  uint32_t interrupt_state = __get_PRIMASK();
+  __disable_irq();
+  if (emergency_stop_generation != stop_generation)
+  {
+    if (interrupt_state == 0U) __enable_irq();
+    Motors_Stop();
+    return 0U;
+  }
+  Motor_SetOne(MO1_IN1, MO1_IN2, left_tenths);
+  /* Motor 2 is physically mirrored, hence the deliberate sign inversion. */
+  Motor_SetOne(MO2_IN1, MO2_IN2, -right_tenths);
+  commanded_left_tenths = (int16_t)left_tenths;
+  commanded_right_tenths = (int16_t)right_tenths;
+  if (interrupt_state == 0U) __enable_irq();
+  return 1U;
 }
 
-static void Motors_Backward(uint32_t percent)
+static void Encoders_Update(void)
 {
-  uint32_t duty = Motors_DutyFromPercent(percent);
+  uint16_t now[2] = {
+    (uint16_t)__HAL_TIM_GET_COUNTER(&htim1),
+    (uint16_t)__HAL_TIM_GET_COUNTER(&htim3)
+  };
+  encoder_total[0] += (int16_t)(now[0] - encoder_previous[0]);
+  encoder_total[1] += (int16_t)(now[1] - encoder_previous[1]);
+  encoder_previous[0] = now[0];
+  encoder_previous[1] = now[1];
+}
 
-  Motors_Stop();
-  HAL_Delay(10);
+static void Encoders_Reset(void)
+{
+  __HAL_TIM_SET_COUNTER(&htim1, 0U);
+  __HAL_TIM_SET_COUNTER(&htim3, 0U);
+  encoder_previous[0] = 0U;
+  encoder_previous[1] = 0U;
+  encoder_total[0] = 0;
+  encoder_total[1] = 0;
+}
 
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, duty);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0U);
+static HAL_StatusTypeDef I2C_Write8(uint8_t address, uint16_t reg, uint8_t value)
+{
+  return HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(address << 1), reg,
+                           I2C_MEMADD_SIZE_16BIT, &value, 1U, 20U);
+}
 
-  HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+static HAL_StatusTypeDef I2C_Read(uint8_t address, uint16_t reg, uint8_t *data, uint16_t length)
+{
+  return HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(address << 1), reg,
+                          I2C_MEMADD_SIZE_16BIT, data, length, 20U);
+}
+
+static const uint8_t vl53_default_configuration[] = {
+  /* 0x2E/0x2F are 1 because this PCB pulls I2C/GPIO up to AVDD (3.3 V). */
+  0x00,0x01,0x01,0x01,0x02,0x00,0x02,0x08,0x00,0x08,0x10,0x01,0x01,0x00,0x00,0x00,
+  0x00,0xff,0x00,0x0f,0x00,0x00,0x00,0x00,0x00,0x20,0x0b,0x00,0x00,0x02,0x0a,0x21,
+  0x00,0x00,0x05,0x00,0x00,0x00,0x00,0xc8,0x00,0x00,0x38,0xff,0x01,0x00,0x08,0x00,
+  0x00,0x01,0xcc,0x0f,0x01,0xf1,0x0d,0x01,0x68,0x00,0x80,0x08,0xb8,0x00,0x00,0x00,
+  0x00,0x0f,0x89,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x0f,0x0d,0x0e,0x0e,0x00,
+  0x00,0x02,0xc7,0xff,0x9b,0x00,0x00,0x00,0x01,0x00,0x00
+};
+
+static uint8_t VL53_InitOne(GPIO_TypeDef *port, uint16_t pin, uint8_t address)
+{
+  uint8_t boot = 0U;
+  HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);
+  HAL_Delay(5);
+  for (uint32_t start = HAL_GetTick(); HAL_GetTick() - start < 100U; )
+  {
+    if (I2C_Read(VL53_DEFAULT_ADDR, 0x00E5U, &boot, 1U) == HAL_OK && boot != 0U) break;
+  }
+  if (boot == 0U || I2C_Write8(VL53_DEFAULT_ADDR, 0x0001U, address) != HAL_OK) return 0U;
+  for (uint16_t i = 0U; i < sizeof(vl53_default_configuration); i++)
+  {
+    if (I2C_Write8(address, (uint16_t)(0x002DU + i), vl53_default_configuration[i]) != HAL_OK) return 0U;
+  }
+  return (I2C_Write8(address, 0x0087U, 0x40U) == HAL_OK) ? 1U : 0U;
+}
+
+static void SensorHardware_Init(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+  ADC_ChannelConfTypeDef adc_channel = {0};
+
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_I2C1_CLK_ENABLE();
+  __HAL_RCC_ADC3_CLK_ENABLE();
+
+  gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  gpio.Mode = GPIO_MODE_AF_OD;
+  gpio.Pull = GPIO_PULLUP;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  gpio.Alternate = GPIO_AF4_I2C1;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  hi2c1.Instance = I2C1;
+  /* 100 kHz with the present 8 MHz I2C1 kernel clock. */
+  hi2c1.Init.Timing = 0x30300909U;
+  hi2c1.Init.OwnAddress1 = 0U;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0U;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
+
+  gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &gpio);
+
+  hadc3.Instance = ADC3;
+  hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc3.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc3.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc3.Init.ContinuousConvMode = DISABLE;
+  hadc3.Init.DiscontinuousConvMode = DISABLE;
+  hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc3.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc3.Init.NbrOfConversion = 1;
+  hadc3.Init.DMAContinuousRequests = DISABLE;
+  hadc3.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc3) != HAL_OK) Error_Handler();
+  adc_channel.Channel = ADC_CHANNEL_10;
+  adc_channel.Rank = ADC_REGULAR_RANK_1;
+  adc_channel.SamplingTime = ADC_SAMPLETIME_56CYCLES;
+  HAL_ADC_ConfigChannel(&hadc3, &adc_channel);
+
+  gpio.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 |
+             GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+  gpio.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &gpio);
+  HAL_GPIO_WritePin(GPIOE, gpio.Pin, GPIO_PIN_RESET);
+
+  /* LSM6DSO: WHO_AM_I must be 0x6C. */
+  uint8_t reg = 0x8FU, who = 0U, tx[2];
+  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi2, &reg, 1U, 10U);
+  HAL_SPI_Receive(&hspi2, &who, 1U, 10U);
+  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+  if (who == 0x6CU)
+  {
+    tx[0] = 0x12U; tx[1] = 0x44U;
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    tx[0] = 0x10U; tx[1] = 0x4CU; /* 104 Hz, +/-8 g */
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    tx[0] = 0x11U; tx[1] = 0x4CU; /* 104 Hz, +/-2000 dps */
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    sensor_flags |= FLAG_IMU;
+  }
+
+  /* LIS2MDL breakout: absence is valid and is reported as not detected. */
+  who = 0U;
+  if (HAL_I2C_Mem_Read(&hi2c1, LIS2MDL_ADDR << 1, 0x4FU, I2C_MEMADD_SIZE_8BIT, &who, 1U, 20U) == HAL_OK && who == 0x40U)
+  {
+    uint8_t config = 0x00U;
+    HAL_I2C_Mem_Write(&hi2c1, LIS2MDL_ADDR << 1, 0x60U, I2C_MEMADD_SIZE_8BIT, &config, 1U, 20U);
+    sensor_flags |= FLAG_MAG;
+  }
+
+  if (VL53_InitOne(GPIOE, GPIO_PIN_13, 0x2AU)) sensor_flags |= FLAG_TOF_1;
+  if (VL53_InitOne(GPIOE, GPIO_PIN_14, 0x2BU)) sensor_flags |= FLAG_TOF_2;
+  if (VL53_InitOne(GPIOE, GPIO_PIN_15, 0x2CU)) sensor_flags |= FLAG_TOF_3;
+  sensor_flags |= FLAG_IR;
+}
+
+static uint16_t IR_ReadChannel(uint32_t channel)
+{
+  ADC_ChannelConfTypeDef config = {0};
+  config.Channel = channel;
+  config.Rank = ADC_REGULAR_RANK_1;
+  config.SamplingTime = ADC_SAMPLETIME_56CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc3, &config) != HAL_OK) return 0U;
+  if (HAL_ADC_Start(&hadc3) != HAL_OK) return 0U;
+  if (HAL_ADC_PollForConversion(&hadc3, 2U) != HAL_OK) return 0U;
+  uint16_t value = (uint16_t)HAL_ADC_GetValue(&hadc3);
+  HAL_ADC_Stop(&hadc3);
+  return value;
+}
+
+static void Sensors_Update(void)
+{
+  if ((sensor_flags & FLAG_IMU) != 0U)
+  {
+    uint8_t reg = 0xA2U, raw[12] = {0};
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
+    if (HAL_SPI_Transmit(&hspi2, &reg, 1U, 10U) == HAL_OK && HAL_SPI_Receive(&hspi2, raw, 12U, 10U) == HAL_OK)
+    {
+      for (uint8_t i = 0U; i < 3U; i++)
+      {
+        int16_t gyro = (int16_t)(((uint16_t)raw[i * 2U + 1U] << 8) | raw[i * 2U]);
+        int16_t accel = (int16_t)(((uint16_t)raw[i * 2U + 7U] << 8) | raw[i * 2U + 6U]);
+        imu_values[i + 3U] = (int32_t)gyro * 70L; /* mdps */
+        imu_values[i] = ((int32_t)accel * 244L) / 1000L; /* mg */
+      }
+    }
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+  }
+
+  if ((sensor_flags & FLAG_MAG) != 0U)
+  {
+    uint8_t raw[6] = {0};
+    if (HAL_I2C_Mem_Read(&hi2c1, LIS2MDL_ADDR << 1, 0x68U, I2C_MEMADD_SIZE_8BIT, raw, 6U, 20U) == HAL_OK)
+    {
+      for (uint8_t i = 0U; i < 3U; i++)
+      {
+        int16_t value = (int16_t)(((uint16_t)raw[i * 2U + 1U] << 8) | raw[i * 2U]);
+        mag_values[i] = ((int32_t)value * 3L) / 2L;
+      }
+    }
+  }
+
+  const uint32_t channels[4] = {ADC_CHANNEL_10, ADC_CHANNEL_11, ADC_CHANNEL_12, ADC_CHANNEL_13};
+  const uint16_t emitters[4] = {GPIO_PIN_2, GPIO_PIN_3, GPIO_PIN_4, GPIO_PIN_5};
+  for (uint8_t i = 0U; i < 4U; i++)
+  {
+    uint16_t ambient = IR_ReadChannel(channels[i]);
+    HAL_GPIO_WritePin(GPIOE, emitters[i], GPIO_PIN_SET);
+    HAL_Delay(1U);
+    uint16_t lit = IR_ReadChannel(channels[i]);
+    HAL_GPIO_WritePin(GPIOE, emitters[i], GPIO_PIN_RESET);
+    ir_values[i] = (lit > ambient) ? (uint16_t)(lit - ambient) : 0U;
+  }
+
+  const uint8_t addresses[3] = {0x2AU, 0x2BU, 0x2CU};
+  const uint8_t flags[3] = {FLAG_TOF_1, FLAG_TOF_2, FLAG_TOF_3};
+  for (uint8_t i = 0U; i < 3U; i++)
+  {
+    if ((sensor_flags & flags[i]) == 0U) continue;
+    uint8_t ready = 0U, range[2] = {0};
+    if (I2C_Read(addresses[i], 0x0031U, &ready, 1U) == HAL_OK && (ready & 1U) != 0U &&
+        I2C_Read(addresses[i], 0x0096U, range, 2U) == HAL_OK)
+    {
+      tof_values[i] = (uint16_t)(((uint16_t)range[0] << 8) | range[1]);
+      I2C_Write8(addresses[i], 0x0086U, 0x01U);
+    }
+  }
+}
+
+static void Protocol_Send(const char *text)
+{
+  uint8_t start_tx = 0U;
+  size_t length = strlen(text);
+  if (length > 511U) return;
+  uint32_t interrupt_state = __get_PRIMASK();
+  __disable_irq();
+  uint16_t used = (uint16_t)((uart_tx_head - uart_tx_tail) & 0x01FFU);
+  uint16_t free_bytes = (uint16_t)(511U - used);
+  if (length <= free_bytes)
+  {
+    while (*text != '\0')
+    {
+      uart_tx_ring[uart_tx_head] = (uint8_t)*text++;
+      uart_tx_head = (uint16_t)((uart_tx_head + 1U) & 0x01FFU);
+    }
+  }
+  if (uart_tx_busy == 0U && uart_tx_tail != uart_tx_head)
+  {
+    uart_tx_busy = 1U;
+    uart_tx_byte = uart_tx_ring[uart_tx_tail];
+    uart_tx_tail = (uint16_t)((uart_tx_tail + 1U) & 0x01FFU);
+    start_tx = 1U;
+  }
+  if (interrupt_state == 0U) __enable_irq();
+
+  if (start_tx != 0U && HAL_UART_Transmit_IT(&huart1, &uart_tx_byte, 1U) != HAL_OK)
+  {
+    uart_tx_busy = 0U;
+  }
+}
+
+static uint8_t UART_PopByte(uint8_t *value)
+{
+  uint8_t available = 0U;
+  uint32_t interrupt_state = __get_PRIMASK();
+  __disable_irq();
+  if (uart_rx_tail != uart_rx_head)
+  {
+    *value = uart_rx_ring[uart_rx_tail];
+    uart_rx_tail = (uint8_t)((uart_rx_tail + 1U) & 0x7FU);
+    available = 1U;
+  }
+  if (interrupt_state == 0U) __enable_irq();
+  return available;
+}
+
+static void Protocol_HandleLine(char *line, uint32_t command_generation)
+{
+  int left_tenths = 0, right_tenths = 0;
+  int left_percent = 0, right_percent = 0;
+  long duration = 0L;
+  int motor_fields = sscanf(line, "M10 %d %d %ld",
+                            &left_tenths, &right_tenths, &duration);
+  if (motor_fields != 3 &&
+      sscanf(line, "M %d %d %ld", &left_percent, &right_percent, &duration) == 3)
+  {
+    left_tenths = ClampMotorPercent(left_percent) * 10;
+    right_tenths = ClampMotorPercent(right_percent) * 10;
+    motor_fields = 3;
+  }
+
+  if (motor_fields == 3)
+  {
+    if (duration <= 0L)
+    {
+      Motors_Stop();
+    }
+    else
+    {
+      if (duration > (long)MOTOR_MAX_RUN_MS) duration = MOTOR_MAX_RUN_MS;
+      if (Motors_SetSignedTenths(left_tenths, right_tenths,
+                                 command_generation) != 0U)
+      {
+        motor_stop_tick = HAL_GetTick() + (uint32_t)duration;
+      }
+      else
+      {
+        Protocol_Send("ERR STALE_MOTOR_COMMAND\r\n");
+        return;
+      }
+    }
+    Protocol_Send("ACK M\r\n");
+  }
+  else if (strcmp(line, "STOP") == 0)
+  {
+    Motors_Stop();
+    Protocol_Send("ACK STOP\r\n");
+  }
+  else if (strcmp(line, "ZERO_ENC") == 0)
+  {
+    Encoders_Reset();
+    Protocol_Send("ACK ZERO_ENC\r\n");
+  }
+  else if (sscanf(line, "TELEM %ld", &duration) == 1)
+  {
+    if (duration < 200L) duration = 200L;
+    if (duration > 2000L) duration = 2000L;
+    telemetry_period_ms = (uint32_t)duration;
+    Protocol_Send("ACK TELEM\r\n");
+  }
+  else if (strcmp(line, "HELLO") == 0 || strcmp(line, "?") == 0)
+  {
+    Protocol_Send("HELLO MICROMOUSE_HUB 2 MAX_PWM=71.0\r\n");
+  }
+  else
+  {
+    Protocol_Send("ERR UNKNOWN_COMMAND\r\n");
+  }
+}
+
+static void Protocol_SendTelemetry(void)
+{
+  char output[256];
+  uint8_t flags = sensor_flags;
+  if (HAL_GPIO_ReadPin(BT_STATE_GPIO_Port, BT_STATE_Pin) == GPIO_PIN_SET) flags |= FLAG_BT_CONNECTED;
+  if (commanded_left_tenths != 0 || commanded_right_tenths != 0) flags |= FLAG_MOTORS_ACTIVE;
+  int n = snprintf(output, sizeof(output),
+    "T,%lu,%d,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
+    (unsigned long)HAL_GetTick(), commanded_left_tenths, commanded_right_tenths,
+    (long)encoder_total[0], (long)encoder_total[1],
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[0] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[1] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[2] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[3] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[4] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_IMU) ? imu_values[5] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_MAG) ? mag_values[0] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_MAG) ? mag_values[1] : SENSOR_MISSING),
+    (long)((sensor_flags & FLAG_MAG) ? mag_values[2] : SENSOR_MISSING),
+    (unsigned)ir_values[0], (unsigned)ir_values[1],
+    (unsigned)ir_values[2], (unsigned)ir_values[3],
+    (unsigned)tof_values[0], (unsigned)tof_values[1],
+    (unsigned)tof_values[2], (unsigned)flags);
+  if (n > 0 && n < (int)sizeof(output)) Protocol_Send(output);
 }
 
 /* USER CODE END 0 */
@@ -148,25 +596,12 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-#if 0
-  /* Previous Bluetooth counter-transmit test. */
-  uint32_t counter = 0;
-  char message[32];
-#endif
-
-  uint8_t received_byte = 0;
-#if 0
-  /* Previous Bluetooth LED-control test responses. */
-  static const uint8_t led_on_message[] = "LED ON\r\n";
-  static const uint8_t led_off_message[] = "LED OFF\r\n";
-#endif
-  static const uint8_t ready_message[] = "MICROMOUSE READY MAX_PWM=71\r\n";
-  static const uint8_t forward_message[] = "FORWARD 50\r\n";
-  static const uint8_t backward_message[] = "BACKWARD 50\r\n";
-  static const uint8_t stop_message[] = "STOP\r\n";
-  static const uint8_t timeout_message[] = "TIMEOUT STOP\r\n";
-  uint32_t last_motor_command_tick = 0U;
-  uint8_t motors_active = 0U;
+  uint8_t received_byte = 0U;
+  char command_line[64] = {0};
+  uint8_t command_length = 0U;
+  uint32_t command_generation = 0U;
+  uint32_t observed_stop_flush = 0U;
+  uint32_t last_telemetry_tick = 0U;
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -212,8 +647,20 @@ int main(void)
   }
 
   Motors_Stop();
-  HAL_UART_Transmit(&huart1, (uint8_t *)ready_message,
-                    sizeof(ready_message) - 1U, 100U);
+  HAL_NVIC_SetPriority(USART1_IRQn, 5U, 0U);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+  if (HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL) != HAL_OK ||
+      HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  Encoders_Reset();
+  SensorHardware_Init();
+  Protocol_Send("HELLO MICROMOUSE_HUB 2 MAX_PWM=71.0\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -223,81 +670,56 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-#if 0
-    /* Previous Bluetooth counter-transmit test. */
-    int length = snprintf(message, sizeof(message), "%lu\r\n",
-                          (unsigned long)counter++);
+    Encoders_Update();
 
-    if (length > 0)
+    /* RX interrupts keep collecting bytes even during the 9600-baud telemetry TX. */
+    while (UART_PopByte(&received_byte) != 0U)
     {
-      HAL_UART_Transmit(&huart1, (uint8_t *)message, (uint16_t)length, 100);
+      uint32_t current_flush = uart_stop_flush_generation;
+      if (observed_stop_flush != current_flush)
+      {
+        command_length = 0U;
+        observed_stop_flush = current_flush;
+        continue; /* This byte may have been popped just before the ISR flush. */
+      }
+      if (received_byte == '\n' || received_byte == '\r')
+      {
+        if (command_length > 0U)
+        {
+          command_line[command_length] = '\0';
+          Protocol_HandleLine(command_line, command_generation);
+          command_length = 0U;
+        }
+      }
+      else if (command_length < sizeof(command_line) - 1U)
+      {
+        if (command_length == 0U) command_generation = emergency_stop_generation;
+        command_line[command_length++] = (char)received_byte;
+      }
+      else
+      {
+        command_length = 0U;
+        Protocol_Send("ERR COMMAND_TOO_LONG\r\n");
+      }
     }
 
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);   // heartbeat LED
-    HAL_Delay(1000);                         // send one number per second
-#endif
-
-#if 0
-    /* Previous Bluetooth LED-control test. */
-    if (HAL_UART_Receive(&huart1, &received_byte, 1, 100) == HAL_OK)
+    if (motor_timeout_event_pending != 0U)
     {
-      if (received_byte == '1')
-      {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
-        HAL_UART_Transmit(&huart1, (uint8_t *)led_on_message,
-                          sizeof(led_on_message) - 1U, 100);
-      }
-      else if (received_byte == '0')
-      {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-        HAL_UART_Transmit(&huart1, (uint8_t *)led_off_message,
-                          sizeof(led_off_message) - 1U, 100);
-      }
-      /* Other characters, including carriage return/newline, are ignored. */
-    }
-#endif
-
-    /* Receive one Bluetooth command; the timeout keeps the main loop responsive. */
-    if (HAL_UART_Receive(&huart1, &received_byte, 1, 100) == HAL_OK)
-    {
-      if (received_byte == 'f' || received_byte == 'F')
-      {
-        Motors_Forward(MOTOR_COMMAND_DUTY_PERCENT);
-        last_motor_command_tick = HAL_GetTick();
-        motors_active = 1U;
-        HAL_UART_Transmit(&huart1, (uint8_t *)forward_message,
-                          sizeof(forward_message) - 1U, 100);
-      }
-      else if (received_byte == 'b' || received_byte == 'B')
-      {
-        Motors_Backward(MOTOR_COMMAND_DUTY_PERCENT);
-        last_motor_command_tick = HAL_GetTick();
-        motors_active = 1U;
-        HAL_UART_Transmit(&huart1, (uint8_t *)backward_message,
-                          sizeof(backward_message) - 1U, 100);
-      }
-      else if (received_byte == 's' || received_byte == 'S')
-      {
-        Motors_Stop();
-        motors_active = 0U;
-        HAL_UART_Transmit(&huart1, (uint8_t *)stop_message,
-                          sizeof(stop_message) - 1U, 100);
-      }
-      else if (received_byte == '?')
-      {
-        HAL_UART_Transmit(&huart1, (uint8_t *)ready_message,
-                          sizeof(ready_message) - 1U, 100U);
-      }
-      /* Carriage return, newline, and other characters are ignored. */
+      motor_timeout_event_pending = 0U;
+      Protocol_Send("EVENT MOTOR_TIMEOUT\r\n");
     }
 
-    if (motors_active != 0U &&
-        HAL_GetTick() - last_motor_command_tick > MOTOR_COMMAND_TIMEOUT_MS)
+    if (emergency_stop_ack_pending != 0U)
     {
-      Motors_Stop();
-      motors_active = 0U;
-      HAL_UART_Transmit(&huart1, (uint8_t *)timeout_message,
-                        sizeof(timeout_message) - 1U, 100U);
+      emergency_stop_ack_pending = 0U;
+      Protocol_Send("ACK STOP\r\n");
+    }
+
+    if (HAL_GetTick() - last_telemetry_tick >= telemetry_period_ms)
+    {
+      last_telemetry_tick = HAL_GetTick();
+      Sensors_Update();
+      Protocol_SendTelemetry();
     }
   }
   /* USER CODE END 3 */
@@ -718,7 +1140,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|BT_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+
+  /* HC-05 module enable is active high on the installed breakout. */
+  HAL_GPIO_WritePin(BT_EN_GPIO_Port, BT_EN_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, NSLEEP_HB_1_Pin|NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
@@ -740,7 +1165,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /* HC-05 KEY/EN: low selects normal Bluetooth data mode. */
+  /* HC-05 EN: keep high so the Bluetooth module remains powered/enabled. */
   GPIO_InitStruct.Pin = BT_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -772,6 +1197,85 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void Micromouse_SafetyTick(void)
+{
+  if ((commanded_left_tenths != 0 || commanded_right_tenths != 0) &&
+      motor_stop_tick != 0U && (int32_t)(HAL_GetTick() - motor_stop_tick) >= 0)
+  {
+    emergency_stop_generation++;
+    Motors_Stop();
+    motor_timeout_event_pending = 1U;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    static const uint8_t stop_text[4] = {'S', 'T', 'O', 'P'};
+    if (uart_rx_byte == '\r' || uart_rx_byte == '\n')
+    {
+      if (uart_stop_candidate != 0U && uart_stop_index == sizeof(stop_text))
+      {
+        emergency_stop_generation++;
+        Motors_Stop();
+        uart_rx_tail = uart_rx_head; /* Discard every command received before STOP. */
+        uart_stop_flush_generation++;
+        emergency_stop_ack_pending = 1U;
+      }
+      uart_stop_candidate = 1U;
+      uart_stop_index = 0U;
+    }
+    else if (uart_stop_candidate != 0U)
+    {
+      if (uart_stop_index < sizeof(stop_text) && uart_rx_byte == stop_text[uart_stop_index])
+      {
+        uart_stop_index++;
+      }
+      else
+      {
+        uart_stop_candidate = 0U;
+      }
+    }
+
+    uint8_t next = (uint8_t)((uart_rx_head + 1U) & 0x7FU);
+    if (next != uart_rx_tail)
+    {
+      uart_rx_ring[uart_rx_head] = uart_rx_byte;
+      uart_rx_head = next;
+    }
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    if (uart_tx_tail != uart_tx_head)
+    {
+      uart_tx_byte = uart_tx_ring[uart_tx_tail];
+      uart_tx_tail = (uint16_t)((uart_tx_tail + 1U) & 0x01FFU);
+      if (HAL_UART_Transmit_IT(&huart1, &uart_tx_byte, 1U) != HAL_OK)
+      {
+        uart_tx_busy = 0U;
+      }
+    }
+    else
+    {
+      uart_tx_busy = 0U;
+    }
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
+  }
+}
 
 /* USER CODE END 4 */
 
