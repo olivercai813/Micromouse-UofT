@@ -25,6 +25,7 @@ extern SPI_HandleTypeDef hspi2;
 
 static IMU_Data_t imu_data = {0};
 static float      prev_omega_rads = 0.0f;
+static bool       imu_present = false;
 
 static inline void IMU_CS_Low(void)
 {
@@ -63,6 +64,10 @@ bool IMU_Init(void)
 
     uint8_t who_am_i = 0U;
     IMU_ReadRegs(IMU_REG_WHO_AM_I, &who_am_i, 1U);
+    if (who_am_i != IMU_WHO_AM_I_VALUE) {
+        imu_present = false;
+        return false;            /* wrong chip or no answer: leave it alone */
+    }
 
     /* Enable Block Data Update (BDU) and Register Address Auto-Increment */
     IMU_WriteReg(IMU_REG_CTRL3_C, 0x44U);
@@ -74,7 +79,13 @@ bool IMU_Init(void)
     IMU_WriteReg(IMU_REG_CTRL2_G, 0x8CU);
 
     HAL_Delay(20);
-    return (who_am_i != 0x00U && who_am_i != 0xFFU);
+    imu_present = true;
+    return true;
+}
+
+bool IMU_IsPresent(void)
+{
+    return imu_present;
 }
 
 /**
@@ -84,6 +95,7 @@ bool IMU_Init(void)
 float IMU_CalibrateGyroBias(uint16_t num_samples)
 {
     if (num_samples == 0U) num_samples = 500U;
+    if (!imu_present) return 0.0f;
 
     float sum_degs = 0.0f;
     for (uint16_t i = 0; i < num_samples; i++) {
@@ -103,8 +115,15 @@ float IMU_CalibrateGyroBias(uint16_t num_samples)
   */
 void IMU_Update(float dt_s)
 {
+    if (!imu_present) return;
+
     uint8_t raw_buf[12] = {0};
     IMU_ReadRegs(IMU_REG_OUTX_L_G, raw_buf, 12U);
+
+    for (int i = 0; i < 3; i++) {
+        imu_data.gyro_raw[i]  = (int16_t)(((uint16_t)raw_buf[2 * i + 1] << 8) | raw_buf[2 * i]);
+        imu_data.accel_raw[i] = (int16_t)(((uint16_t)raw_buf[2 * i + 7] << 8) | raw_buf[2 * i + 6]);
+    }
 
     /* Combine little-endian 16-bit signed registers:
      * Bytes 0..5:  GX, GY, GZ

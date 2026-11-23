@@ -47,7 +47,7 @@ extern "C" {
 /* Invert flags (-1 or 1) to easily match physical Left/Right wiring polarity */
 #define MOTOR_1_DIR_INVERT        1
 #define MOTOR_2_DIR_INVERT       -1
-#define ENCODER_1_DIR_INVERT      1
+#define ENCODER_1_DIR_INVERT     -1    /* left counted backwards in the bench test */
 #define ENCODER_2_DIR_INVERT      1
 
 /* Map logical Left/Right wheels to Motor 1 and Motor 2 */

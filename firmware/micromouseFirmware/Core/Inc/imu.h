@@ -46,6 +46,7 @@ extern "C" {
 /*             CONFIGURABLE IMU REGISTER MAP (Default: ST LSM6DSx)            */
 /* ========================================================================== */
 #define IMU_REG_WHO_AM_I          0x0FU
+#define IMU_WHO_AM_I_VALUE        0x6CU    /* LSM6DSO answers 0x6C            */
 #define IMU_REG_CTRL1_XL          0x10U    /* Accelerometer ODR & Full-scale  */
 #define IMU_REG_CTRL2_G           0x11U    /* Gyroscope ODR & Full-scale      */
 #define IMU_REG_CTRL3_C           0x12U    /* BDU & Auto-increment            */
@@ -70,6 +71,9 @@ typedef struct {
     float accel_y_imu_ms2;        /* Raw lateral accel at IMU location (m/s^2)*/
     float accel_x_center_ms2;     /* Lever-arm compensated CoR accel (m/s^2)  */
     float accel_y_center_ms2;     /* Lever-arm compensated CoR accel (m/s^2)  */
+
+    int16_t gyro_raw[3];          /* Raw X/Y/Z gyro counts (70 mdps/LSB)      */
+    int16_t accel_raw[3];         /* Raw X/Y/Z accel counts (0.244 mg/LSB)    */
 } IMU_Data_t;
 
 /* ========================================================================== */
@@ -81,6 +85,7 @@ void              IMU_Update(float dt_s);
 const IMU_Data_t* IMU_GetData(void);
 float             IMU_GetGyroZ_degs(void);
 float             IMU_GetCenterAccelX_ms2(void);
+bool              IMU_IsPresent(void);
 
 #ifdef __cplusplus
 }
