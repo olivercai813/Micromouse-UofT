@@ -24,6 +24,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <stdbool.h>
+#include "ir.h"
+#include "motor.h"
+#include "imu.h"
+#include "pid.h"
+#include "kalman.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,12 +40,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* Motor input pins -> TIM4 channels */
-#define MO1_IN1   TIM_CHANNEL_1   // PD12  TIM4_CH1  Motor 1 (U3, J8)
-#define MO1_IN2   TIM_CHANNEL_2   // PD13  TIM4_CH2
-#define MO2_IN1   TIM_CHANNEL_3   // PD14  TIM4_CH3  Motor 2 (U2, J7)
-#define MO2_IN2   TIM_CHANNEL_4   // PD15  TIM4_CH4
-#define MOTOR_MAX_DUTY_PERCENT      71U
+/* Motor pins, PWM, encoders and their directions now live in motor.h. */
+#define MOTOR_MAX_DUTY_INT          71U   /* same limit as MOTOR_MAX_DUTY_PERCENT */
 #define MOTOR_MAX_DUTY_TENTHS      710U
 #define MOTOR_MAX_RUN_MS         10000U
 #define TELEMETRY_DEFAULT_MS       250U
@@ -55,6 +58,36 @@
 
 #define LIS2MDL_ADDR       0x1EU
 #define VL53_DEFAULT_ADDR  0x29U
+
+/* ---- Control loop (motor + imu + kalman + pid) ---------------------------- */
+#define CONTROL_LOOP_HZ          1000U    /* 1 ms control step                 */
+#define CONTROL_DT_MAX_S         0.05f    /* cap dt after a slow sensor read   */
+
+/* Stall protection reads the motor current (VISEN) on ADC1/ADC2. Keep it OFF
+ * until the VREF+ bridge (U1 pin 20 -> 21) is soldered: before that the ADC
+ * readings are garbage and could stop the motors for no reason. */
+#define MOTOR_STALL_PROTECTION   0
+
+/* Starting gains: GUESSES. Tune them over Bluetooth with the GAINS command. */
+#define FWD_KP        0.020f    /* % duty per (mm/s) of speed error          */
+#define FWD_KI        0.200f    /* % duty per (mm/s * s)                      */
+#define FWD_KD        0.000f
+#define FWD_KF        0.070f    /* % duty per mm/s asked for (feedforward)   */
+#define FWD_I_MAX     30.0f     /* anti-windup limit, % duty                  */
+#define ROT_KP        0.800f    /* % duty difference per degree of error     */
+#define ROT_KI        0.000f
+#define ROT_KD        0.030f    /* % duty per deg/s (damping)                */
+#define ROT_FF        0.050f    /* % duty per deg/s asked for (feedforward)  */
+#define ROT_OUT_MAX   40.0f     /* max % duty difference between wheels      */
+#define ROT_I_MAX     20.0f
+
+#define TURN_RATE_DEGS        180.0f  /* how fast TURN rotates the target     */
+#define TURN_DONE_DEG         2.0f    /* "arrived" when within this many deg  */
+#define TURN_DONE_RATE_DEGS   10.0f   /* ...and turning slower than this      */
+#define TURN_SETTLE_MS        50U     /* ...for this long                     */
+#define TURN_DEFAULT_MS       3000U   /* safety timeout for TURN              */
+#define SPEED_LIMIT_MMS       1000
+#define RATE_LIMIT_DEGS       720
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -77,8 +110,6 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 static I2C_HandleTypeDef hi2c1;
 static ADC_HandleTypeDef hadc3;
-static int32_t encoder_total[2] = {0, 0};
-static uint16_t encoder_previous[2] = {0, 0};
 static int32_t imu_values[6] = {0};
 static int32_t mag_values[3] = {0};
 static uint16_t ir_values[4] = {0};
@@ -103,6 +134,25 @@ static volatile uint16_t uart_tx_head = 0U;
 static volatile uint16_t uart_tx_tail = 0U;
 static volatile uint8_t uart_tx_busy = 0U;
 static uint8_t uart_tx_ring[512] = {0};
+
+/* Motion control state */
+enum { CTRL_OFF = 0U, CTRL_OPEN_LOOP, CTRL_VELOCITY, CTRL_TURN };
+static volatile uint8_t control_mode = CTRL_OFF;
+static volatile uint8_t motors_enabled = 0U;
+static volatile uint8_t turn_done_event_pending = 0U;
+#if MOTOR_STALL_PROTECTION
+static volatile uint8_t stall_event_pending = 0U;
+#endif
+static PID_Controller_t pid_forward;
+static PID_Controller_t pid_rotation;
+static YawKalman_t yaw_kf;
+static float rot_feedforward = ROT_FF;
+static float target_speed_mms = 0.0f;
+static float target_rate_degs = 0.0f;
+static float target_heading_deg = 0.0f;
+static float turn_final_deg = 0.0f;
+static uint32_t turn_settle_ms = 0U;
+static uint32_t control_last_cycles = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -118,11 +168,10 @@ static void MX_SPI2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void Motors_Stop(void);
-static uint32_t Motors_DutyFromTenths(uint32_t percent_tenths);
 static uint8_t Motors_SetSignedTenths(int32_t left_tenths, int32_t right_tenths,
                                       uint32_t command_generation);
-static void Encoders_Update(void);
-static void Encoders_Reset(void);
+static void Control_Init(void);
+static void Control_Tick(void);
 static void SensorHardware_Init(void);
 static void Sensors_Update(void);
 static void Protocol_HandleLine(char *line, uint32_t command_generation);
@@ -132,34 +181,25 @@ static uint8_t UART_PopByte(uint8_t *value);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---------------------------------------------------------------------------
+ * Motor power on/off. Motors_Stop() is also called from interrupts (SysTick
+ * timeout and the UART "STOP" detector), so it only touches registers/pins.
+ * ------------------------------------------------------------------------- */
 static void Motors_Stop(void)
 {
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN1, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO1_IN2, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN1, 0U);
-  __HAL_TIM_SET_COMPARE(&htim4, MO2_IN2, 0U);
-
-  HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
+  Motor_SleepAll();                       /* brake both, then nSLEEP low */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  control_mode = CTRL_OFF;
+  motors_enabled = 0U;
   commanded_left_tenths = 0;
   commanded_right_tenths = 0;
   motor_stop_tick = 0U;
 }
 
-static uint32_t Motors_DutyFromTenths(uint32_t percent_tenths)
-{
-  if (percent_tenths > MOTOR_MAX_DUTY_TENTHS)
-  {
-    percent_tenths = MOTOR_MAX_DUTY_TENTHS;
-  }
-  return ((__HAL_TIM_GET_AUTORELOAD(&htim4) + 1U) * percent_tenths) / 1000U;
-}
-
 static int32_t ClampMotorPercent(int32_t percent)
 {
-  if (percent > (int32_t)MOTOR_MAX_DUTY_PERCENT) return MOTOR_MAX_DUTY_PERCENT;
-  if (percent < -(int32_t)MOTOR_MAX_DUTY_PERCENT) return -(int32_t)MOTOR_MAX_DUTY_PERCENT;
+  if (percent > (int32_t)MOTOR_MAX_DUTY_INT) return MOTOR_MAX_DUTY_INT;
+  if (percent < -(int32_t)MOTOR_MAX_DUTY_INT) return -(int32_t)MOTOR_MAX_DUTY_INT;
   return percent;
 }
 
@@ -170,79 +210,233 @@ static int32_t ClampMotorTenths(int32_t percent_tenths)
   return percent_tenths;
 }
 
-static void Motor_SetOne(uint32_t in1, uint32_t in2, int32_t percent_tenths)
+static float ClampFloat(float value, float limit)
 {
-  uint32_t duty = Motors_DutyFromTenths((uint32_t)abs(percent_tenths));
-
-  if (percent_tenths > 0)
-  {
-    __HAL_TIM_SET_COMPARE(&htim4, in1, duty);
-    __HAL_TIM_SET_COMPARE(&htim4, in2, 0U);
-  }
-  else if (percent_tenths < 0)
-  {
-    __HAL_TIM_SET_COMPARE(&htim4, in1, 0U);
-    __HAL_TIM_SET_COMPARE(&htim4, in2, duty);
-  }
-  else
-  {
-    __HAL_TIM_SET_COMPARE(&htim4, in1, 0U);
-    __HAL_TIM_SET_COMPARE(&htim4, in2, 0U);
-  }
+  if (value > limit) return limit;
+  if (value < -limit) return -limit;
+  return value;
 }
 
-static uint8_t Motors_SetSignedTenths(int32_t left_tenths, int32_t right_tenths,
-                                      uint32_t command_generation)
+/* Wake both H-bridges and switch to <mode>, unless a STOP arrived after the
+ * command was received (stale generation). Returns 1 if the motors are live.
+ * On success interrupts are left DISABLED so the caller can set the first
+ * duty atomically; the caller must call Motors_EndStart() afterwards. */
+static uint8_t Motors_BeginStart(uint32_t command_generation, uint8_t mode,
+                                 uint32_t *interrupt_state)
 {
-  uint32_t stop_generation = emergency_stop_generation;
-  if (stop_generation != command_generation) return 0U;
-  left_tenths = ClampMotorTenths(left_tenths);
-  right_tenths = ClampMotorTenths(right_tenths);
+  if (emergency_stop_generation != command_generation) return 0U;
 
   Motors_Stop();
-  if (left_tenths == 0 && right_tenths == 0) return 1U;
+  Motor_WakeAll();
+  HAL_Delay(2);                           /* MP6550 wake-up time */
 
-  HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_SET);
-  HAL_Delay(2);
-
-  uint32_t interrupt_state = __get_PRIMASK();
+  *interrupt_state = __get_PRIMASK();
   __disable_irq();
-  if (emergency_stop_generation != stop_generation)
+  if (emergency_stop_generation != command_generation)
   {
-    if (interrupt_state == 0U) __enable_irq();
+    if (*interrupt_state == 0U) __enable_irq();
     Motors_Stop();
     return 0U;
   }
-  Motor_SetOne(MO1_IN1, MO1_IN2, left_tenths);
-  /* Motor 2 is physically mirrored, hence the deliberate sign inversion. */
-  Motor_SetOne(MO2_IN1, MO2_IN2, -right_tenths);
-  commanded_left_tenths = (int16_t)left_tenths;
-  commanded_right_tenths = (int16_t)right_tenths;
-  if (interrupt_state == 0U) __enable_irq();
+  control_mode = mode;
+  motors_enabled = 1U;
   return 1U;
 }
 
-static void Encoders_Update(void)
+static void Motors_EndStart(uint32_t interrupt_state)
 {
-  uint16_t now[2] = {
-    (uint16_t)__HAL_TIM_GET_COUNTER(&htim1),
-    (uint16_t)__HAL_TIM_GET_COUNTER(&htim3)
-  };
-  encoder_total[0] += (int16_t)(now[0] - encoder_previous[0]);
-  encoder_total[1] += (int16_t)(now[1] - encoder_previous[1]);
-  encoder_previous[0] = now[0];
-  encoder_previous[1] = now[1];
+  if (interrupt_state == 0U) __enable_irq();
 }
 
-static void Encoders_Reset(void)
+/* Open-loop drive (the old "M" / "M10" commands): fixed duty per wheel. */
+static uint8_t Motors_SetSignedTenths(int32_t left_tenths, int32_t right_tenths,
+                                      uint32_t command_generation)
 {
-  __HAL_TIM_SET_COUNTER(&htim1, 0U);
-  __HAL_TIM_SET_COUNTER(&htim3, 0U);
-  encoder_previous[0] = 0U;
-  encoder_previous[1] = 0U;
-  encoder_total[0] = 0;
-  encoder_total[1] = 0;
+  uint32_t interrupt_state = 0U;
+  left_tenths = ClampMotorTenths(left_tenths);
+  right_tenths = ClampMotorTenths(right_tenths);
+
+  if (left_tenths == 0 && right_tenths == 0)
+  {
+    if (emergency_stop_generation != command_generation) return 0U;
+    Motors_Stop();
+    return 1U;
+  }
+
+  if (Motors_BeginStart(command_generation, CTRL_OPEN_LOOP, &interrupt_state) == 0U) return 0U;
+  /* motor.c applies the mirror-image inversion of motor 2 itself. */
+  Motor_SetDuty(MOTOR_LEFT, (float)left_tenths / 10.0f);
+  Motor_SetDuty(MOTOR_RIGHT, (float)right_tenths / 10.0f);
+  commanded_left_tenths = (int16_t)left_tenths;
+  commanded_right_tenths = (int16_t)right_tenths;
+  Motors_EndStart(interrupt_state);
+  return 1U;
+}
+
+/* Closed-loop drive: forward speed (mm/s) + turn rate (deg/s, + = left/CCW). */
+static uint8_t Motion_StartVelocity(float speed_mms, float rate_degs,
+                                    uint32_t command_generation)
+{
+  uint32_t interrupt_state = 0U;
+  PID_Reset(&pid_forward);
+  PID_Reset(&pid_rotation);
+  target_speed_mms = speed_mms;
+  target_rate_degs = rate_degs;
+  target_heading_deg = Kalman_GetHeading_deg(&yaw_kf);
+  if (Motors_BeginStart(command_generation, CTRL_VELOCITY, &interrupt_state) == 0U) return 0U;
+  Motors_EndStart(interrupt_state);
+  return 1U;
+}
+
+/* Turn on the spot by <angle_deg> (+ = left/CCW) using the fused heading. */
+static uint8_t Motion_StartTurn(float angle_deg, uint32_t command_generation)
+{
+  uint32_t interrupt_state = 0U;
+  PID_Reset(&pid_forward);
+  PID_Reset(&pid_rotation);
+  target_speed_mms = 0.0f;
+  target_rate_degs = 0.0f;
+  target_heading_deg = Kalman_GetHeading_deg(&yaw_kf);
+  turn_final_deg = target_heading_deg + angle_deg;
+  turn_settle_ms = 0U;
+  if (Motors_BeginStart(command_generation, CTRL_TURN, &interrupt_state) == 0U) return 0U;
+  Motors_EndStart(interrupt_state);
+  return 1U;
+}
+
+/* ---------------------------------------------------------------------------
+ * 1 kHz control step: odometry -> IMU -> Kalman heading -> PID -> motors.
+ * Called on every pass of the main loop; it runs only when >= 1 ms passed.
+ * ------------------------------------------------------------------------- */
+static void Control_Init(void)
+{
+  /* Cycle counter for an exact dt (ir.c also enables it; harmless twice). */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR = 0xC5ACCE55U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  control_last_cycles = DWT->CYCCNT;
+
+  /* Forward speed loop: output = % duty (both wheels). Kf = % duty per mm/s. */
+  PID_Init(&pid_forward, FWD_KP, FWD_KI, FWD_KD, FWD_KF,
+           -MOTOR_MAX_DUTY_PERCENT, MOTOR_MAX_DUTY_PERCENT, FWD_I_MAX);
+  /* Heading loop: output = % duty difference between the wheels. */
+  PID_Init(&pid_rotation, ROT_KP, ROT_KI, ROT_KD, 0.0f,
+           -ROT_OUT_MAX, ROT_OUT_MAX, ROT_I_MAX);
+}
+
+static void Control_Tick(void)
+{
+  uint32_t now = DWT->CYCCNT;
+  uint32_t elapsed = now - control_last_cycles;
+  uint32_t period = SystemCoreClock / CONTROL_LOOP_HZ;
+  if (elapsed < period) return;
+  control_last_cycles = now;
+
+  float dt = (float)elapsed / (float)SystemCoreClock;
+  if (dt > CONTROL_DT_MAX_S) dt = CONTROL_DT_MAX_S;  /* after a slow sensor read */
+
+  /* 1. Sensors */
+  Motor_UpdateOdometry(dt);
+  IMU_Update(dt);
+  float enc_rate = Motor_GetAngularVelocity_degs();
+  float gyro_rate = IMU_IsPresent() ? IMU_GetData()->gyro_z_raw_degs : enc_rate;
+  const Motor_State_t *left = Motor_GetState(MOTOR_LEFT);
+  const Motor_State_t *right = Motor_GetState(MOTOR_RIGHT);
+  bool stationary = (motors_enabled == 0U) &&
+                    fabsf(left->velocity_mms) < 1.0f &&
+                    fabsf(right->velocity_mms) < 1.0f;
+
+  /* 2. Heading estimate: gyro + encoders (Kalman also learns the gyro bias). */
+  Kalman_Update(&yaw_kf, gyro_rate, enc_rate, stationary, dt);
+
+#if MOTOR_STALL_PROTECTION
+  if (motors_enabled != 0U && Motor_CheckStall())
+  {
+    emergency_stop_generation++;
+    Motors_Stop();
+    stall_event_pending = 1U;
+    return;
+  }
+#endif
+
+  /* 3. Closed-loop motion */
+  uint8_t mode = control_mode;
+  if (mode != CTRL_VELOCITY && mode != CTRL_TURN) return;
+
+  float heading = Kalman_GetHeading_deg(&yaw_kf);
+  if (mode == CTRL_TURN)
+  {
+    /* Move the target heading towards the final angle at TURN_RATE_DEGS,
+     * so the mouse turns smoothly instead of jumping. */
+    float remaining = turn_final_deg - target_heading_deg;
+    float step = TURN_RATE_DEGS * dt;
+    if (fabsf(remaining) <= step)
+    {
+      target_heading_deg = turn_final_deg;
+      target_rate_degs = 0.0f;
+    }
+    else
+    {
+      target_rate_degs = (remaining > 0.0f) ? TURN_RATE_DEGS : -TURN_RATE_DEGS;
+      target_heading_deg += target_rate_degs * dt;
+    }
+
+    if (target_rate_degs == 0.0f &&
+        fabsf(turn_final_deg - heading) < TURN_DONE_DEG &&
+        fabsf(Kalman_GetAngularVelocity_degs(&yaw_kf)) < TURN_DONE_RATE_DEGS)
+    {
+      turn_settle_ms += (uint32_t)(dt * 1000.0f + 0.5f);
+      if (turn_settle_ms >= TURN_SETTLE_MS)
+      {
+        Motors_Stop();
+        turn_done_event_pending = 1U;
+        return;
+      }
+    }
+    else
+    {
+      turn_settle_ms = 0U;
+    }
+  }
+  else
+  {
+    target_heading_deg += target_rate_degs * dt;
+  }
+
+  float forward = PID_Compute(&pid_forward, target_speed_mms,
+                              Motor_GetLinearVelocity_mms(), dt);
+  float turn = PID_Compute(&pid_rotation, target_heading_deg, heading, dt) +
+               rot_feedforward * target_rate_degs;
+
+  /* Turning left (CCW, +) means the right wheel goes faster. */
+  float left_duty = ClampFloat(forward - turn, MOTOR_MAX_DUTY_PERCENT);
+  float right_duty = ClampFloat(forward + turn, MOTOR_MAX_DUTY_PERCENT);
+
+  /* Apply only if no STOP/timeout happened since this step started. */
+  uint32_t interrupt_state = __get_PRIMASK();
+  __disable_irq();
+  if (control_mode == mode && motors_enabled != 0U)
+  {
+    Motor_SetDuty(MOTOR_LEFT, left_duty);
+    Motor_SetDuty(MOTOR_RIGHT, right_duty);
+    commanded_left_tenths = (int16_t)(left_duty * 10.0f);
+    commanded_right_tenths = (int16_t)(right_duty * 10.0f);
+  }
+  if (interrupt_state == 0U) __enable_irq();
+}
+
+/* Format a float with one decimal without needing printf float support. */
+static void FormatTenths(char *out, size_t size, float value)
+{
+  long tenths = lroundf(value * 10.0f);
+  const char *sign = (tenths < 0) ? "-" : "";
+  if (tenths < 0) tenths = -tenths;
+  snprintf(out, size, "%s%ld.%ld", sign, tenths / 10L, tenths % 10L);
+}
+
+static long ToMilli(float value)
+{
+  return lroundf(value * 1000.0f);
 }
 
 static HAL_StatusTypeDef I2C_Write8(uint8_t address, uint16_t reg, uint8_t value)
@@ -344,25 +538,14 @@ static void SensorHardware_Init(void)
   HAL_GPIO_Init(GPIOE, &gpio);
   HAL_GPIO_WritePin(GPIOE, gpio.Pin, GPIO_PIN_RESET);
 
-  /* LSM6DSO: WHO_AM_I must be 0x6C. */
-  uint8_t reg = 0x8FU, who = 0U, tx[2];
-  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi2, &reg, 1U, 10U);
-  HAL_SPI_Receive(&hspi2, &who, 1U, 10U);
-  HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-  if (who == 0x6CU)
-  {
-    tx[0] = 0x12U; tx[1] = 0x44U;
-    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-    tx[0] = 0x10U; tx[1] = 0x4CU; /* 104 Hz, +/-8 g */
-    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-    tx[0] = 0x11U; tx[1] = 0x4CU; /* 104 Hz, +/-2000 dps */
-    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET); HAL_SPI_Transmit(&hspi2, tx, 2U, 10U); HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-    sensor_flags |= FLAG_IMU;
-  }
+  /* IR wall sensors: emitters PE2..PE5, receivers PC0..PC3 on ADC3 (ir.c). */
+  IR_Init(&hadc3);
+
+  /* LSM6DSO IMU on SPI2 (imu.c): 1.66 kHz, +/-2000 dps, +/-8 g. */
+  if (IMU_Init()) sensor_flags |= FLAG_IMU;
 
   /* LIS2MDL breakout: absence is valid and is reported as not detected. */
-  who = 0U;
+  uint8_t who = 0U;
   if (HAL_I2C_Mem_Read(&hi2c1, LIS2MDL_ADDR << 1, 0x4FU, I2C_MEMADD_SIZE_8BIT, &who, 1U, 20U) == HAL_OK && who == 0x40U)
   {
     uint8_t config = 0x00U;
@@ -376,37 +559,17 @@ static void SensorHardware_Init(void)
   sensor_flags |= FLAG_IR;
 }
 
-static uint16_t IR_ReadChannel(uint32_t channel)
-{
-  ADC_ChannelConfTypeDef config = {0};
-  config.Channel = channel;
-  config.Rank = ADC_REGULAR_RANK_1;
-  config.SamplingTime = ADC_SAMPLETIME_56CYCLES;
-  if (HAL_ADC_ConfigChannel(&hadc3, &config) != HAL_OK) return 0U;
-  if (HAL_ADC_Start(&hadc3) != HAL_OK) return 0U;
-  if (HAL_ADC_PollForConversion(&hadc3, 2U) != HAL_OK) return 0U;
-  uint16_t value = (uint16_t)HAL_ADC_GetValue(&hadc3);
-  HAL_ADC_Stop(&hadc3);
-  return value;
-}
-
 static void Sensors_Update(void)
 {
   if ((sensor_flags & FLAG_IMU) != 0U)
   {
-    uint8_t reg = 0xA2U, raw[12] = {0};
-    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
-    if (HAL_SPI_Transmit(&hspi2, &reg, 1U, 10U) == HAL_OK && HAL_SPI_Receive(&hspi2, raw, 12U, 10U) == HAL_OK)
+    /* The control loop reads the IMU every 1 ms; just copy the latest sample. */
+    const IMU_Data_t *imu = IMU_GetData();
+    for (uint8_t i = 0U; i < 3U; i++)
     {
-      for (uint8_t i = 0U; i < 3U; i++)
-      {
-        int16_t gyro = (int16_t)(((uint16_t)raw[i * 2U + 1U] << 8) | raw[i * 2U]);
-        int16_t accel = (int16_t)(((uint16_t)raw[i * 2U + 7U] << 8) | raw[i * 2U + 6U]);
-        imu_values[i + 3U] = (int32_t)gyro * 70L; /* mdps */
-        imu_values[i] = ((int32_t)accel * 244L) / 1000L; /* mg */
-      }
+      imu_values[i + 3U] = (int32_t)imu->gyro_raw[i] * 70L;            /* mdps */
+      imu_values[i] = ((int32_t)imu->accel_raw[i] * 244L) / 1000L;    /* mg */
     }
-    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
   }
 
   if ((sensor_flags & FLAG_MAG) != 0U)
@@ -422,16 +585,12 @@ static void Sensors_Update(void)
     }
   }
 
-  const uint32_t channels[4] = {ADC_CHANNEL_10, ADC_CHANNEL_11, ADC_CHANNEL_12, ADC_CHANNEL_13};
-  const uint16_t emitters[4] = {GPIO_PIN_2, GPIO_PIN_3, GPIO_PIN_4, GPIO_PIN_5};
-  for (uint8_t i = 0U; i < 4U; i++)
+  /* IR: pulsed, ambient-cancelled reading of all four sensors (ir.c).
+   * Telemetry keeps sending the raw signal (lit - ambient) as before. */
+  IR_Update();
+  for (uint8_t i = 0U; i < IR_COUNT; i++)
   {
-    uint16_t ambient = IR_ReadChannel(channels[i]);
-    HAL_GPIO_WritePin(GPIOE, emitters[i], GPIO_PIN_SET);
-    HAL_Delay(1U);
-    uint16_t lit = IR_ReadChannel(channels[i]);
-    HAL_GPIO_WritePin(GPIOE, emitters[i], GPIO_PIN_RESET);
-    ir_values[i] = (lit > ambient) ? (uint16_t)(lit - ambient) : 0U;
+    ir_values[i] = IR_GetSignal(i);
   }
 
   const uint8_t addresses[3] = {0x2AU, 0x2BU, 0x2CU};
@@ -540,8 +699,113 @@ static void Protocol_HandleLine(char *line, uint32_t command_generation)
   }
   else if (strcmp(line, "ZERO_ENC") == 0)
   {
-    Encoders_Reset();
+    /* Zero the distance AND the heading (handy before a test run). */
+    Motor_ResetOdometry();
+    Kalman_ResetHeading(&yaw_kf, 0.0f);
+    target_heading_deg = 0.0f;
+    turn_final_deg = 0.0f;
     Protocol_Send("ACK ZERO_ENC\r\n");
+  }
+  else if (sscanf(line, "V %d %d %ld", &left_percent, &right_percent, &duration) == 3)
+  {
+    /* V <speed mm/s> <turn rate deg/s> <ms>: closed-loop drive.
+     * V 200 0 2000 = straight at 200 mm/s for 2 s, holding the heading. */
+    if (left_percent > SPEED_LIMIT_MMS) left_percent = SPEED_LIMIT_MMS;
+    if (left_percent < -SPEED_LIMIT_MMS) left_percent = -SPEED_LIMIT_MMS;
+    if (right_percent > RATE_LIMIT_DEGS) right_percent = RATE_LIMIT_DEGS;
+    if (right_percent < -RATE_LIMIT_DEGS) right_percent = -RATE_LIMIT_DEGS;
+    if (duration <= 0L)
+    {
+      Motors_Stop();
+    }
+    else
+    {
+      if (duration > (long)MOTOR_MAX_RUN_MS) duration = MOTOR_MAX_RUN_MS;
+      if (Motion_StartVelocity((float)left_percent, (float)right_percent,
+                               command_generation) == 0U)
+      {
+        Protocol_Send("ERR STALE_MOTOR_COMMAND\r\n");
+        return;
+      }
+      motor_stop_tick = HAL_GetTick() + (uint32_t)duration;
+    }
+    Protocol_Send("ACK V\r\n");
+  }
+  else if (sscanf(line, "TURN %d", &left_percent) == 1)
+  {
+    /* TURN <deg> [timeout ms]: turn on the spot, + = left. EVENT TURN_DONE
+     * is sent when it arrives; EVENT MOTOR_TIMEOUT if it never does. */
+    if (sscanf(line, "TURN %d %ld", &left_percent, &duration) != 2) duration = TURN_DEFAULT_MS;
+    if (left_percent > 720) left_percent = 720;
+    if (left_percent < -720) left_percent = -720;
+    if (duration <= 0L || duration > (long)MOTOR_MAX_RUN_MS) duration = TURN_DEFAULT_MS;
+    if (Motion_StartTurn((float)left_percent, command_generation) == 0U)
+    {
+      Protocol_Send("ERR STALE_MOTOR_COMMAND\r\n");
+      return;
+    }
+    motor_stop_tick = HAL_GetTick() + (uint32_t)duration;
+    Protocol_Send("ACK TURN\r\n");
+  }
+  else if (strcmp(line, "POSE") == 0)
+  {
+    /* Heading (deg, + = left), turn rate (deg/s), learnt gyro bias (deg/s),
+     * distance (mm), speed (mm/s), and the raw encoder-only heading. */
+    char head[16], rate[16], bias[16], dist[16], vel[16], enc[16], pose_text[160];
+    FormatTenths(head, sizeof(head), Kalman_GetHeading_deg(&yaw_kf));
+    FormatTenths(rate, sizeof(rate), Kalman_GetAngularVelocity_degs(&yaw_kf));
+    FormatTenths(bias, sizeof(bias), Kalman_GetGyroBias_degs(&yaw_kf));
+    FormatTenths(dist, sizeof(dist), Motor_GetLinearDistance_mm());
+    FormatTenths(vel, sizeof(vel), Motor_GetLinearVelocity_mms());
+    FormatTenths(enc, sizeof(enc), Motor_GetHeading_deg());
+    int n = snprintf(pose_text, sizeof(pose_text),
+                     "POSE HEAD %s RATE %s BIAS %s DIST %s VEL %s ENCHEAD %s IMU %u\r\n",
+                     head, rate, bias, dist, vel, enc, IMU_IsPresent() ? 1U : 0U);
+    if (n > 0 && n < (int)sizeof(pose_text)) Protocol_Send(pose_text);
+  }
+  else if (strncmp(line, "GAINS", 5) == 0)
+  {
+    /* GAINS                      -> print gains (all values x1000)
+     * GAINS F <kp> <ki> <kd> <kf> -> forward speed loop, x1000
+     * GAINS R <kp> <ki> <kd> <ff> -> heading loop, x1000
+     * Example: GAINS F 20 200 0 70  means Kp=0.020 Ki=0.200 Kd=0 Kf=0.070 */
+    long g[4] = {0};
+    char which = 0;
+    char gains_text[160];
+    if (sscanf(line, "GAINS %c %ld %ld %ld %ld", &which, &g[0], &g[1], &g[2], &g[3]) == 5)
+    {
+      if (motors_enabled != 0U)
+      {
+        Protocol_Send("ERR GAINS_WHILE_MOVING\r\n");
+        return;
+      }
+      if (which == 'F' || which == 'f')
+      {
+        PID_SetGains(&pid_forward, g[0] / 1000.0f, g[1] / 1000.0f, g[2] / 1000.0f, g[3] / 1000.0f);
+      }
+      else if (which == 'R' || which == 'r')
+      {
+        PID_SetGains(&pid_rotation, g[0] / 1000.0f, g[1] / 1000.0f, g[2] / 1000.0f, 0.0f);
+        rot_feedforward = g[3] / 1000.0f;
+      }
+      else
+      {
+        Protocol_Send("ERR GAINS_ARGS (use GAINS F|R kp ki kd ff, x1000)\r\n");
+        return;
+      }
+    }
+    else if (strcmp(line, "GAINS") != 0)
+    {
+      Protocol_Send("ERR GAINS_ARGS (use GAINS F|R kp ki kd ff, x1000)\r\n");
+      return;
+    }
+    int n = snprintf(gains_text, sizeof(gains_text),
+                     "GAINS F %ld %ld %ld %ld R %ld %ld %ld %ld\r\n",
+                     ToMilli(pid_forward.Kp), ToMilli(pid_forward.Ki),
+                     ToMilli(pid_forward.Kd), ToMilli(pid_forward.Kf),
+                     ToMilli(pid_rotation.Kp), ToMilli(pid_rotation.Ki),
+                     ToMilli(pid_rotation.Kd), ToMilli(rot_feedforward));
+    if (n > 0 && n < (int)sizeof(gains_text)) Protocol_Send(gains_text);
   }
   else if (sscanf(line, "TELEM %ld", &duration) == 1)
   {
@@ -549,6 +813,86 @@ static void Protocol_HandleLine(char *line, uint32_t command_generation)
     if (duration > 2000L) duration = 2000L;
     telemetry_period_ms = (uint32_t)duration;
     Protocol_Send("ACK TELEM\r\n");
+  }
+  else if (strcmp(line, "IR") == 0)
+  {
+    /* Fresh IR reading: signal, ambient, distance (mm) and wall bits. */
+    char ir_text[200];
+    IR_Update();
+    int n = snprintf(ir_text, sizeof(ir_text),
+      "IR SIG %u %u %u %u AMB %u %u %u %u MM %u %u %u %u WALL %u%u%u%u\r\n",
+      IR_GetSignal(0), IR_GetSignal(1), IR_GetSignal(2), IR_GetSignal(3),
+      IR_GetAmbient(0), IR_GetAmbient(1), IR_GetAmbient(2), IR_GetAmbient(3),
+      IR_GetDistance_mm(0), IR_GetDistance_mm(1),
+      IR_GetDistance_mm(2), IR_GetDistance_mm(3),
+      IR_IsWall(0), IR_IsWall(1), IR_IsWall(2), IR_IsWall(3));
+    if (n > 0 && n < (int)sizeof(ir_text)) Protocol_Send(ir_text);
+  }
+  else if (sscanf(line, "IRCAL %d %d", &left_percent, &right_percent) == 2)
+  {
+    /* IRCAL <sensor 1-4> <mm>: wall held at <mm> from that sensor. */
+    char ir_text[64];
+    if (left_percent < 1 || left_percent > (int)IR_COUNT ||
+        right_percent < 10 || right_percent > (int)IR_DISTANCE_MAX_MM)
+    {
+      Protocol_Send("ERR IRCAL_ARGS (use IRCAL <1-4> <10-300>)\r\n");
+    }
+    else if (IR_Calibrate((uint8_t)(left_percent - 1), (uint16_t)right_percent) != 0U)
+    {
+      int n = snprintf(ir_text, sizeof(ir_text), "ACK IRCAL %d K=%lu\r\n", left_percent,
+                       (unsigned long)IR_GetCalK((uint8_t)(left_percent - 1)));
+      if (n > 0 && n < (int)sizeof(ir_text)) Protocol_Send(ir_text);
+    }
+    else
+    {
+      Protocol_Send("ERR IRCAL_SIGNAL (too weak or saturated)\r\n");
+    }
+  }
+  else if (sscanf(line, "IRWALL %d %d", &left_percent, &right_percent) == 2)
+  {
+    /* IRWALL <sensor 1-4> <mm>: a wall closer than <mm> counts as a wall. */
+    char ir_text[48];
+    if (left_percent < 1 || left_percent > (int)IR_COUNT ||
+        right_percent < 10 || right_percent > (int)IR_DISTANCE_MAX_MM)
+    {
+      Protocol_Send("ERR IRWALL_ARGS (use IRWALL <1-4> <10-300>)\r\n");
+    }
+    else
+    {
+      IR_SetWallThreshold_mm((uint8_t)(left_percent - 1), (uint16_t)right_percent);
+      int n = snprintf(ir_text, sizeof(ir_text), "ACK IRWALL %d %d\r\n",
+                       left_percent, right_percent);
+      if (n > 0 && n < (int)sizeof(ir_text)) Protocol_Send(ir_text);
+    }
+  }
+  else if (sscanf(line, "IRTEST %d", &left_percent) == 1)
+  {
+    /* IRTEST <1-4>: hold that IR LED on for 2 s. Point a phone camera at it:
+     * a working emitter shows as a purple/white glow on the screen. */
+    if (left_percent < 1 || left_percent > (int)IR_COUNT)
+    {
+      Protocol_Send("ERR IRTEST_ARGS (use IRTEST <1-4>)\r\n");
+    }
+    else if (motors_enabled != 0U)
+    {
+      Protocol_Send("ERR IRTEST_MOTORS_RUNNING\r\n");
+    }
+    else
+    {
+      IR_SetEmitter((uint8_t)(left_percent - 1), 1U);
+      HAL_Delay(2000U);
+      IR_SetEmitter((uint8_t)(left_percent - 1), 0U);
+      Protocol_Send("ACK IRTEST\r\n");
+    }
+  }
+  else if (strcmp(line, "IRK") == 0)
+  {
+    /* Print the calibration constants so they can be copied into ir.c. */
+    char ir_text[96];
+    int n = snprintf(ir_text, sizeof(ir_text), "IRK %lu %lu %lu %lu\r\n",
+                     (unsigned long)IR_GetCalK(0), (unsigned long)IR_GetCalK(1),
+                     (unsigned long)IR_GetCalK(2), (unsigned long)IR_GetCalK(3));
+    if (n > 0 && n < (int)sizeof(ir_text)) Protocol_Send(ir_text);
   }
   else if (strcmp(line, "HELLO") == 0 || strcmp(line, "?") == 0)
   {
@@ -565,11 +909,11 @@ static void Protocol_SendTelemetry(void)
   char output[256];
   uint8_t flags = sensor_flags;
   if (HAL_GPIO_ReadPin(BT_STATE_GPIO_Port, BT_STATE_Pin) == GPIO_PIN_SET) flags |= FLAG_BT_CONNECTED;
-  if (commanded_left_tenths != 0 || commanded_right_tenths != 0) flags |= FLAG_MOTORS_ACTIVE;
+  if (motors_enabled != 0U) flags |= FLAG_MOTORS_ACTIVE;
   int n = snprintf(output, sizeof(output),
     "T,%lu,%d,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
     (unsigned long)HAL_GetTick(), commanded_left_tenths, commanded_right_tenths,
-    (long)encoder_total[0], (long)encoder_total[1],
+    (long)Motor_GetState(MOTOR_LEFT)->total_ticks, (long)Motor_GetState(MOTOR_RIGHT)->total_ticks,
     (long)((sensor_flags & FLAG_IMU) ? imu_values[0] : SENSOR_MISSING),
     (long)((sensor_flags & FLAG_IMU) ? imu_values[1] : SENSOR_MISSING),
     (long)((sensor_flags & FLAG_IMU) ? imu_values[2] : SENSOR_MISSING),
@@ -633,33 +977,23 @@ int main(void)
   MX_SPI2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* Keep both motor drivers asleep during the Bluetooth-only test. */
-  HAL_GPIO_WritePin(NSLEEP_HB_1_GPIO_Port, NSLEEP_HB_1_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(NSLEEP_HB_2_GPIO_Port, NSLEEP_HB_2_Pin, GPIO_PIN_RESET);
-
-  /* Start PWM with every input at 0% duty, then keep both drivers asleep. */
-  if (HAL_TIM_PWM_Start(&htim4, MO1_IN1) != HAL_OK ||
-      HAL_TIM_PWM_Start(&htim4, MO1_IN2) != HAL_OK ||
-      HAL_TIM_PWM_Start(&htim4, MO2_IN1) != HAL_OK ||
-      HAL_TIM_PWM_Start(&htim4, MO2_IN2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
+  /* motor.c: start PWM + encoders, then keep both drivers asleep until a
+   * drive command arrives. */
+  Motor_Init();
   Motors_Stop();
+
   HAL_NVIC_SetPriority(USART1_IRQn, 5U, 0U);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
   if (HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL) != HAL_OK ||
-      HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  Encoders_Reset();
   SensorHardware_Init();
+
+  /* Gyro zero-offset: the mouse must sit still for ~0.5 s after power-up. */
+  Protocol_Send("INFO CALIBRATING_GYRO keep the mouse still\r\n");
+  Kalman_Init(&yaw_kf, IMU_CalibrateGyroBias(500U));
+  Control_Init();
   Protocol_Send("HELLO MICROMOUSE_HUB 2 MAX_PWM=71.0\r\n");
   /* USER CODE END 2 */
 
@@ -670,7 +1004,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    Encoders_Update();
+    Control_Tick();
 
     /* RX interrupts keep collecting bytes even during the 9600-baud telemetry TX. */
     while (UART_PopByte(&received_byte) != 0U)
@@ -708,6 +1042,20 @@ int main(void)
       motor_timeout_event_pending = 0U;
       Protocol_Send("EVENT MOTOR_TIMEOUT\r\n");
     }
+
+    if (turn_done_event_pending != 0U)
+    {
+      turn_done_event_pending = 0U;
+      Protocol_Send("EVENT TURN_DONE\r\n");
+    }
+
+#if MOTOR_STALL_PROTECTION
+    if (stall_event_pending != 0U)
+    {
+      stall_event_pending = 0U;
+      Protocol_Send("EVENT MOTOR_STALL\r\n");
+    }
+#endif
 
     if (emergency_stop_ack_pending != 0U)
     {
@@ -1200,7 +1548,7 @@ static void MX_GPIO_Init(void)
 
 void Micromouse_SafetyTick(void)
 {
-  if ((commanded_left_tenths != 0 || commanded_right_tenths != 0) &&
+  if (motors_enabled != 0U &&
       motor_stop_tick != 0U && (int32_t)(HAL_GetTick() - motor_stop_tick) >= 0)
   {
     emergency_stop_generation++;

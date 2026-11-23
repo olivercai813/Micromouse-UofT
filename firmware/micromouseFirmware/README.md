@@ -117,6 +117,45 @@ Only one program can own the Bluetooth COM port at a time. If the GUI connects
 but receives no telemetry, confirm that the updated firmware was flashed, the
 HC-05 is connected at 9600 baud, and the outgoing COM port was selected.
 
+## Motion control (motor + IMU + Kalman + PID)
+
+`main.c` now runs a 1 kHz control step (`Control_Tick`) built from the modules:
+
+| Module | Job |
+|---|---|
+| `motor.c` | PWM (slow decay), encoders -> distance (mm) and speed (mm/s) |
+| `imu.c` | LSM6DSO gyro/accel over SPI2, gyro zero-offset at power-up |
+| `kalman.c` | Heading (deg, + = left) from gyro + encoders; learns gyro drift |
+| `pid.c` | Two loops: forward speed (encoders) and heading (Kalman) |
+
+**At power-up keep the mouse still for about 1 second** (the hub shows
+`INFO CALIBRATING_GYRO`). The gyro offset is measured then.
+
+Bluetooth commands (all stop on `STOP` and on their timeout, max 10 s):
+
+| Command | What it does |
+|---|---|
+| `V <mm/s> <deg/s> <ms>` | Closed-loop drive. `V 200 0 2000` = straight at 200 mm/s for 2 s, holding heading |
+| `TURN <deg> [ms]` | Turn on the spot (+ = left). Replies `EVENT TURN_DONE` when there |
+| `POSE` | Heading, turn rate, learnt gyro bias, distance, speed, encoder-only heading |
+| `GAINS` | Print PID gains (x1000) |
+| `GAINS F <kp> <ki> <kd> <kf>` | Set forward-speed gains, x1000 (e.g. `GAINS F 20 200 0 70`) |
+| `GAINS R <kp> <ki> <kd> <ff>` | Set heading gains, x1000 (e.g. `GAINS R 800 0 30 50`) |
+| `ZERO_ENC` | Zero distance **and** heading |
+| `M` / `M10` | Unchanged: open-loop duty per wheel |
+
+Before trusting the numbers:
+
+1. Measure the wheels and set `MOTOR_WHEEL_DIAMETER_MM`, `MOTOR_TRACK_WIDTH_MM`,
+   `MOTOR_GEAR_RATIO` and `MOTOR_ENCODER_CPR` in `motor.h` (current values are placeholders).
+2. Rotate the mouse by hand to the left and send `POSE`: `HEAD` and `ENCHEAD` must
+   both go up. If `HEAD` goes down, set `IMU_GYRO_Z_INVERT` to `-1.0f` in `imu.h`.
+   If `ENCHEAD` goes down, flip `ENCODER_1/2_DIR_INVERT` in `motor.h`.
+3. `TURN` and `V` need the wheels on the floor. With the wheels in the air the
+   gyro sees no rotation and `TURN` will just time out.
+4. Stall protection (`MOTOR_STALL_PROTECTION` in `main.c`) is off until the
+   VREF+ fix (U1 pin 20 -> 21) is done, because the current-sense ADC reads garbage before that.
+
 ## KiCad-verified hardware map
 
 The assignments below were extracted from
