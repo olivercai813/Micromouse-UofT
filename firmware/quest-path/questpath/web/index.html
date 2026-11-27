@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quest path tracer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; overflow: hidden;
+               font: 18px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #top { position: fixed; left: 0; right: 0; top: 0; padding: 10px 16px; text-align: center; pointer-events: none; }
+  #message { font-size: 24px; color: #fff; }
+  #status { font-size: 14px; color: #8a8a8a; margin-top: 2px; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px; display: flex; gap: 12px; justify-content: center; }
+  button { font: inherit; font-size: 20px; padding: 12px 22px; min-width: 120px; border-radius: 10px;
+           border: 2px solid #666; background: #1b1b1b; color: #fff; }
+  button:active { background: #333; }
+  button#start { border-color: #3fb950; }
+  button#stop { border-color: #f85149; }
+  button[hidden] { display: none; }
+  body.flashing #bar, body.flashing #status { visibility: hidden; }
+</style>
+</head>
+<body>
+<canvas id="board"></canvas>
+<div id="top"><div id="message">Connecting to the laptop…</div><div id="status"></div></div>
+<div id="bar">
+  <button id="start">Start</button>
+  <button id="stop">Stop</button>
+  <button id="full">Full screen</button>
+  <button id="ar" hidden>Lane on the floor (AR)</button>
+</div>
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// The headset's page of the Quest path tracer.
+//
+// The laptop decides everything; this page draws the lane and flickers the
+// square (or row) it is told to, in step with the display's own frames, and
+// reports when each flash really started and ended on this page's clock.
+//
+// Flicker is a whole number of frames on, the same number off, so its rate
+// is exact: refresh / (2 * frames). The on/off state is worked out from each
+// frame's timestamp, not by counting frames, so a dropped frame costs one
+// frame and never shifts the rhythm.
+// ---------------------------------------------------------------------------
+
+const pageId = Math.random().toString(36).slice(2);
+const seconds = () => performance.now() / 1000;
+const canvas = document.getElementById("board");
+const ctx = canvas.getContext("2d");
+const messageEl = document.getElementById("message");
+const statusEl = document.getElementById("status");
+
+let state = { rows: 8, cols: 3, start: [0, 1], mouse: [0, 1], path: [[0, 1]], active_row: null,
+              message: "", phase: "wait", cell_mm: 180 };
+let refreshHz = 0;           // measured
+let flash = null;            // the flash in progress
+let queued = [];             // flashes waiting their turn
+let connected = false;
+let lastTs = 0;
+let xrSession = null;        // set while the lane is shown on the floor (AR)
+
+function post(obj) {
+  obj.page = pageId;
+  obj.t_send = seconds();
+  return fetch("/event", { method: "POST", headers: { "Content-Type": "application/json" },
+                           body: JSON.stringify(obj), keepalive: true }).catch(() => {});
+}
+
+// --- the display's refresh rate ---------------------------------------------
+function snapRefresh(raw) {
+  const known = [60, 72, 75, 80, 90, 100, 120, 144];
+  const near = known.reduce((a, b) => Math.abs(b - raw) < Math.abs(a - raw) ? b : a);
+  return Math.abs(near - raw) / near < 0.04 ? near : Math.round(raw);
+}
+function measureRefresh(nextFrame) {
+  // median frame interval over about a second: robust to a few late frames
+  return new Promise(resolve => {
+    const gaps = [];
+    let last = null;
+    const step = ts => {
+      if (last !== null) gaps.push(ts - last);
+      last = ts;
+      if (gaps.length < 70) nextFrame(step);
+      else {
+        gaps.sort((a, b) => a - b);
+        resolve(snapRefresh(1000 / gaps[Math.floor(gaps.length / 2)]));
+      }
+    };
+    nextFrame(step);
+  });
+}
+function pickRate(refresh, target) {
+  // same rule as questpath/display.py: nearest exact rate outside the alpha band
+  const options = [];
+  for (let k = 1; k <= 12; k++) options.push({ hz: refresh / (2 * k), k });
+  const clear = options.filter(o => o.hz >= 11.5 && o.hz <= 20);
+  return (clear.length ? clear : options).reduce((a, b) =>
+    Math.abs(b.hz - target) < Math.abs(a.hz - target) ? b : a);
+}
+function hello() {
+  if (!refreshHz) return;
+  const plan = pickRate(refreshHz, 13);
+  post({ type: "hello", refresh: refreshHz, hz: plan.hz, agent: navigator.userAgent, xr: !!xrSession });
+  statusEl.textContent = `display ${refreshHz} Hz · flicker ${plan.hz.toFixed(2)} Hz` + (xrSession ? " · AR" : "");
+}
+
+// --- flashes ------------------------------------------------------------------
+function startFlash(cmd) {
+  if (flash) { queued.push(cmd); return; }
+  const plan = pickRate(refreshHz || 60, cmd.target_hz || 13);
+  const cycles = Math.max(1, Math.round(cmd.seconds * plan.hz));
+  flash = { id: cmd.id, row: cmd.row, col: cmd.col, kind: cmd.kind || "square", hz: plan.hz,
+            half: plan.k / (refreshHz || 60), length: cycles / plan.hz, t0: null, on: false, dropped: 0 };
+  document.body.classList.add("flashing");
+}
+function stepFlash(ts) {
+  // called once per displayed frame, with that frame's timestamp in seconds
+  if (!flash) return;
+  if (flash.t0 === null) flash.t0 = ts;
+  else if (lastTs && ts - lastTs > 1.5 / (refreshHz || 60)) flash.dropped += 1;
+  const elapsed = ts - flash.t0;
+  if (elapsed >= flash.length - 0.25 / (refreshHz || 60)) {
+    post({ type: "flash_done", id: flash.id, t0: flash.t0, t1: flash.t0 + flash.length, hz: flash.hz,
+           refresh: refreshHz, dropped: flash.dropped });
+    flash = null;
+    document.body.classList.remove("flashing");
+    if (queued.length) startFlash(queued.shift());
+    return;
+  }
+  flash.on = Math.floor((elapsed + 0.5 / (refreshHz || 60)) / flash.half) % 2 === 0;
+}
+function flickering(row, col) {
+  // is this square part of the flash in progress, and is it lit this frame?
+  if (!flash || flash.kind === "blank" || flash.t0 === null) return null;
+  if (row !== flash.row) return null;
+  if (flash.kind === "calib" || col === flash.col) return flash.on;
+  return null;
+}
+
+// --- the flat board -------------------------------------------------------------
+function resize() {
+  const scale = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * scale);
+  canvas.height = Math.round(innerHeight * scale);
+}
+addEventListener("resize", resize);
+resize();
+
+function draw() {
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  const cols = state.cols, shown = 3;
+  // three rows are on screen: the row being chosen in the middle, the row
+  // the mouse is in below it, the row after above it
+  const middle = state.active_row !== null && state.active_row !== undefined
+    ? state.active_row : Math.min(state.mouse[0] + 1, state.rows - 1);
+  const size = Math.min(W / (cols + 0.9), (H * 0.80) / shown);
+  const gap = size * 0.14;
+  const left = (W - cols * size) / 2, baseY = H * 0.50 + size * 1.5;
+  const centre = (row, col) => [left + (col + 0.5) * size, baseY - (row - (middle - 1) + 0.5) * size];
+  for (let row = middle - 1; row <= middle + 1; row++) {
+    if (row < 0 || row >= state.rows) continue;
+    for (let col = 0; col < cols; col++) {
+      const [cx, cy] = centre(row, col);
+      const lit = flickering(row, col);
+      const active = row === state.active_row;
+      if (lit === true) ctx.fillStyle = "#fff";
+      else if (lit === false) ctx.fillStyle = "#000";
+      else ctx.fillStyle = active ? "#6a6a6a" : "#1c1c1c";
+      ctx.fillRect(cx - size / 2 + gap / 2, cy - size / 2 + gap / 2, size - gap, size - gap);
+      ctx.lineWidth = Math.max(2, size * 0.012);
+      ctx.strokeStyle = (row === state.start[0] && col === state.start[1]) ? "#3fb950" : (active ? "#bbb" : "#333");
+      ctx.strokeRect(cx - size / 2 + gap / 2, cy - size / 2 + gap / 2, size - gap, size - gap);
+    }
+  }
+  // the path so far
+  ctx.strokeStyle = "#58a6ff";
+  ctx.lineWidth = Math.max(4, size * 0.05);
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  let pen = false;
+  for (const [row, col] of state.path) {
+    if (row < middle - 1 || row > middle + 1) { pen = false; continue; }
+    const [cx, cy] = centre(row, col);
+    if (pen) ctx.lineTo(cx, cy); else ctx.moveTo(cx, cy);
+    pen = true;
+  }
+  ctx.stroke();
+  // the mouse
+  const [mr, mc] = state.mouse;
+  if (mr >= middle - 1 && mr <= middle + 1) {
+    const [cx, cy] = centre(mr, mc), r = size * 0.2;
+    ctx.fillStyle = "#f0883e";
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r * 0.8, cy + r * 0.8);
+    ctx.lineTo(cx - r * 0.8, cy + r * 0.8);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+function frame(tsMs) {
+  const ts = tsMs / 1000;
+  stepFlash(ts);
+  lastTs = ts;
+  draw();
+  if (!xrSession) requestAnimationFrame(frame);
+}
+
+// --- the laptop -------------------------------------------------------------------
+function listen() {
+  const source = new EventSource("/events");
+  source.onopen = () => { connected = true; hello(); };
+  source.onerror = () => {
+    connected = false;
+    messageEl.textContent = "Lost the laptop. Waiting for it…";
+  };
+  source.onmessage = e => {
+    let cmd;
+    try { cmd = JSON.parse(e.data); } catch (err) { return; }
+    if (cmd.cmd === "state") {
+      state = Object.assign({}, state, cmd);
+      messageEl.textContent = state.message || "";
+    } else if (cmd.cmd === "flash") {
+      startFlash(cmd);
+    }
+  };
+}
+document.getElementById("start").onclick = () => post({ type: "button", name: "start" });
+document.getElementById("stop").onclick = () => post({ type: "button", name: "stop" });
+document.getElementById("full").onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+};
+setInterval(() => { if (connected) post({ type: "ping" }); }, 1000);
+if (navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {});
+
+// --- the lane on the floor (AR, experimental) ---------------------------------------
+// The same lane, drawn life-size on the real floor in passthrough, so that the
+// squares lie where the mouse will drive. Needs a secure page (see the README:
+// `adb reverse` and http://localhost). Pinch or pull the trigger to lay the
+// lane down again in front of you. NOT YET TRIED ON A HEADSET.
+async function enterAR() {
+  const session = await navigator.xr.requestSession("immersive-ar", { requiredFeatures: ["local-floor"] });
+  const glCanvas = document.createElement("canvas");
+  const gl = glCanvas.getContext("webgl2", { xrCompatible: true, alpha: true, antialias: true });
+  if (gl.makeXRCompatible) await gl.makeXRCompatible();
+  session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+  const space = await session.requestReferenceSpace("local-floor");
+  const compile = (type, source) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    return shader;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, `#version 300 es
+    in vec3 position; in vec4 colour; uniform mat4 projection, view; out vec4 tint;
+    void main() { tint = colour; gl_Position = projection * view * vec4(position, 1.0); }`));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, `#version 300 es
+    precision mediump float; in vec4 tint; out vec4 colour;
+    void main() { colour = vec4(tint.rgb * tint.a, tint.a); }`));
+  gl.linkProgram(program);
+  const buffer = gl.createBuffer();
+  const aPosition = gl.getAttribLocation(program, "position"), aColour = gl.getAttribLocation(program, "colour");
+  const uProjection = gl.getUniformLocation(program, "projection"), uView = gl.getUniformLocation(program, "view");
+  let origin = null;                       // where the start square lies: {x, z, fx, fz}
+  session.addEventListener("select", () => { origin = null; });
+  session.addEventListener("end", () => { xrSession = null; measureRefresh(requestAnimationFrame).then(hz => {
+    refreshHz = hz; hello(); requestAnimationFrame(frame); }); });
+  xrSession = session;
+  const nextXrFrame = cb => session.requestAnimationFrame(cb);
+  refreshHz = await measureRefresh(nextXrFrame);
+  hello();
+
+  const colourOf = (row, col) => {
+    const lit = flickering(row, col);
+    if (lit === true) return [1, 1, 1, 1];
+    if (lit === false) return [0, 0, 0, 0];
+    if (row === state.mouse[0] && col === state.mouse[1]) return [0.94, 0.53, 0.24, 0.85];
+    if (state.path.some(c => c[0] === row && c[1] === col)) return [0.35, 0.65, 1, 0.55];
+    if (row === state.active_row) return [0.75, 0.75, 0.75, 0.6];
+    if (row === state.start[0] && col === state.start[1]) return [0.25, 0.73, 0.31, 0.6];
+    return [0.5, 0.5, 0.5, 0.18];
+  };
+  const onFrame = (tsMs, xrFrame) => {
+    session.requestAnimationFrame(onFrame);
+    const ts = tsMs / 1000;
+    stepFlash(ts);
+    lastTs = ts;
+    const pose = xrFrame.getViewerPose(space);
+    if (!pose) return;
+    if (!origin) {
+      // lay the lane down: start square 0.6 m in front of the wearer, lane running away
+      const p = pose.transform.position, q = pose.transform.orientation;
+      let fx = -2 * (q.x * q.z + q.w * q.y), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+      const n = Math.hypot(fx, fz) || 1;
+      fx /= n; fz /= n;
+      origin = { x: p.x + 0.6 * fx, z: p.z + 0.6 * fz, fx, fz };
+    }
+    const cell = (state.cell_mm || 180) / 1000, half = cell * 0.45;
+    const lx = origin.fz, lz = -origin.fx;           // the lane's left, on the floor
+    const data = [];
+    for (let row = 0; row < state.rows; row++) {
+      for (let col = 0; col < state.cols; col++) {
+        const colour = colourOf(row, col);
+        if (colour[3] === 0) continue;
+        const along = row * cell, across = (state.start[1] - col) * cell;
+        const cx = origin.x + along * origin.fx + across * lx, cz = origin.z + along * origin.fz + across * lz;
+        const corner = (a, b) => [cx + a * half * origin.fx + b * half * lx, 0.003, cz + a * half * origin.fz + b * half * lz];
+        const quad = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, -1), corner(1, 1), corner(-1, 1)];
+        for (const v of quad) data.push(v[0], v[1], v[2], colour[0], colour[1], colour[2], colour[3]);
+      }
+    }
+    const layer = session.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(aPosition);
+    gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(aColour);
+    gl.vertexAttribPointer(aColour, 4, gl.FLOAT, false, 28, 12);
+    for (const view of pose.views) {
+      const port = layer.getViewport(view);
+      gl.viewport(port.x, port.y, port.width, port.height);
+      gl.uniformMatrix4fv(uProjection, false, view.projectionMatrix);
+      gl.uniformMatrix4fv(uView, false, view.transform.inverse.matrix);
+      gl.drawArrays(gl.TRIANGLES, 0, data.length / 7);
+    }
+  };
+  session.requestAnimationFrame(onFrame);
+}
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported("immersive-ar").then(ok => {
+    if (!ok) return;
+    const button = document.getElementById("ar");
+    button.hidden = false;
+    button.onclick = () => enterAR().catch(err => { xrSession = null; messageEl.textContent = "AR did not start: " + err.message; });
+  }).catch(() => {});
+}
+
+// --- go ---------------------------------------------------------------------------
+measureRefresh(requestAnimationFrame).then(hz => {
+  refreshHz = hz;
+  listen();
+  hello();
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>
